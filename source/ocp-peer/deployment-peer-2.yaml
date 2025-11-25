@@ -1,0 +1,39 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: peer-2
+  namespace: migration-test-system  # Update namespace as needed
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: peer-2
+  template:
+    metadata:
+      labels:
+        app: peer-2
+    spec:
+      # Node selector - uncomment and update for specific node placement
+      # nodeSelector:
+      #   kubernetes.io/hostname: iherman-worker1
+      containers:
+        - name: peer-app
+          # Update image registry for your environment
+          # For airgapped: use your local registry (e.g., registry.example.com:5000/applications/peer-app:latest)
+          image: iherman-bastion-01.ocp.lab:5000/applications/peer-app:latest
+          imagePullPolicy: IfNotPresent  # Use Always in production
+          env:
+            - name: HOSTNAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: PEERS
+              value: "peer-1-svc,peer-2-svc,peer-3-svc"
+          ports:
+            - containerPort: 8080
+              name: ws
+            - containerPort: 8081
+              name: tcp
+            - containerPort: 8082
+              name: http
+

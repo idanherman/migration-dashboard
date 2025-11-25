@@ -1,0 +1,22 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Copy requirements first for better layer caching
+COPY requirements.txt /app/
+
+# Install dependencies (supports offline mode if wheels are pre-downloaded)
+# For airgapped: copy wheels to ./wheels/ and use: pip install --no-index --find-links ./wheels -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy application
+COPY app.py /app/
+
+# Clean up any old Python cache files to ensure the new code is used
+RUN find . -type f -name "*.py[co]" -delete -o -type d -name "__pycache__" -delete
+
+# Expose ports
+EXPOSE 8080 8081 8082
+
+CMD ["python", "app.py"]
+

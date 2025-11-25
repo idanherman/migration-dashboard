@@ -1,0 +1,17 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Copy requirements first for better layer caching
+COPY requirements.txt /app/
+
+# Install dependencies (supports offline mode if wheels are pre-downloaded)
+# For airgapped: copy wheels to ./wheels/ and use: pip install --no-index --find-links ./wheels -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy application
+COPY dashboard.py /app/
+
+EXPOSE 9091
+
+CMD ["python", "dashboard.py"]
