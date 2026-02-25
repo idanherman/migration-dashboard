@@ -1,0 +1,46 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: migration-peer
+  namespace: migration-test-system  # Override via deploy script / NAMESPACE
+spec:
+  selector:
+    matchLabels:
+      app: migration-peer
+  template:
+    metadata:
+      labels:
+        app: migration-peer
+    spec:
+      # Optional: restrict to workers only
+      # nodeSelector:
+      #   node-role.kubernetes.io/worker: ""
+      containers:
+        - name: peer-app
+          # Image is substituted by deploy script from REGISTRY/IMAGE:TAG
+          image: registry.example.com/applications/peer-app:latest
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: HOSTNAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: PEER_SERVICE
+              value: "migration-peer-svc"
+          ports:
+            - containerPort: 8081
+              name: tcp
+            - containerPort: 8082
+              name: http

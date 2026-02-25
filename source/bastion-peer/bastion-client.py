@@ -34,10 +34,18 @@ def load_config():
         logging.warning("Invalid NODEPORT_PEERS JSON, using defaults")
         config["NODEPORT_PEERS"] = {"peer-1-np": {"host": "172.17.95.101", "ws_port": 30926, "tcp_port": 30808, "http_port": 30402}, "peer-2-np": {"host": "172.17.95.102", "ws_port": 31183, "tcp_port": 30565, "http_port": 31865}, "peer-3-np": {"host": "172.17.95.103", "ws_port": 31560, "tcp_port": 31004, "http_port": 30067}}
     
-    # Route peers (comma-separated URLs)
-    route_str = os.getenv("ROUTE_PEERS", "http://peer-1-route-migration-test-system.apps.ocp.lab,http://peer-2-route-migration-test-system.apps.ocp.lab,http://peer-3-route-migration-test-system.apps.ocp.lab")
+    # Route peers (comma-separated URLs) - optional, for legacy external tests
+    route_str = os.getenv("ROUTE_PEERS", "")
     config["ROUTE_PEERS"] = [url.strip() for url in route_str.split(",") if url.strip()]
-    
+
+    # Per-node status endpoints (NodePort with externalTrafficPolicy: Local) - one URL per node
+    node_endpoints = os.getenv("NODE_STATUS_ENDPOINTS", "")
+    config["NODE_STATUS_ENDPOINTS"] = [url.strip() for url in node_endpoints.split(",") if url.strip()]
+
+    # Per-node route endpoints (optional) - for router connectivity test, one URL per node
+    route_endpoints = os.getenv("ROUTE_STATUS_ENDPOINTS", "")
+    config["ROUTE_STATUS_ENDPOINTS"] = [url.strip() for url in route_endpoints.split(",") if url.strip()]
+
     # Intervals (in seconds)
     config["HTTP_INTERVAL"] = float(os.getenv("HTTP_INTERVAL", "1.0"))
     config["WS_INTERVAL"] = float(os.getenv("WS_INTERVAL", "0.5"))
@@ -62,6 +70,8 @@ CONFIG = load_config()
 METALLB_PEERS = CONFIG["METALLB_PEERS"]
 NODEPORT_PEERS = CONFIG["NODEPORT_PEERS"]
 ROUTE_PEERS = CONFIG["ROUTE_PEERS"]
+NODE_STATUS_ENDPOINTS = CONFIG["NODE_STATUS_ENDPOINTS"]
+ROUTE_STATUS_ENDPOINTS = CONFIG["ROUTE_STATUS_ENDPOINTS"]
 HTTP_INTERVAL = CONFIG["HTTP_INTERVAL"]
 WS_INTERVAL = CONFIG["WS_INTERVAL"]
 TCP_INTERVAL = CONFIG["TCP_INTERVAL"]
@@ -193,45 +203,68 @@ async def tcp_client_task(name: str, host: str, port: int):
                 except Exception: pass
             await asyncio.sleep(RECONNECT_DELAY)
 
+def _merge_peer_history(peer_hist: list) -> None:
+    """Merge peer history into STATE['history'], dedupe, sort, cap."""
+    filtered = []
+    for ev in peer_hist:
+        ev.setdefault("source", "pod")
+        if _is_after_cutoff(ev):
+            filtered.append(ev)
+    if not filtered:
+        return
+    known = {
+        (h.get("name"), h.get("protocol"), h.get("start_time"),
+         h.get("end_time"), h.get("source"), h.get("reporter"))
+        for h in STATE["history"]
+    }
+    new_items = [ev for ev in filtered if (ev.get("name"), ev.get("protocol"), ev.get("start_time"),
+                ev.get("end_time"), ev.get("source"), ev.get("reporter")) not in known]
+    if new_items:
+        STATE["history"][0:0] = new_items
+        STATE["history"].sort(key=lambda h: h.get("end_time") or "", reverse=True)
+        del STATE["history"][MAX_HISTORY:]
+
 async def poll_peer_status_task(name: str, base_url: str):
-    status_url, history_url = f"{base_url}/status", f"{base_url}/history"
+    """Legacy: poll by name and base_url (for ROUTE_PEERS)."""
+    status_url, history_url = f"{base_url.rstrip('/')}/status", f"{base_url.rstrip('/')}/history"
     timeout = aiohttp.ClientTimeout(total=HTTP_TIMEOUT)
     async with aiohttp.ClientSession(timeout=timeout) as session:
         while True:
-            # /status
             try:
                 async with session.get(status_url) as resp:
                     resp.raise_for_status()
                     STATE["internal_status"][name] = await resp.json()
             except Exception as e:
                 STATE["internal_status"][name] = {"error": str(e), "url": status_url}
-            # /history
             try:
                 async with session.get(history_url) as resp:
                     resp.raise_for_status()
-                    peer_hist = await resp.json()
-                    # mark source and filter by cutoff
-                    filtered = []
-                    for ev in peer_hist:
-                        ev.setdefault("source", "pod")
-                        if _is_after_cutoff(ev):
-                            filtered.append(ev)
-                    if filtered:
-                        known = {
-                            (h.get("name"), h.get("protocol"), h.get("start_time"),
-                             h.get("end_time"), h.get("source"), h.get("reporter"))
-                            for h in STATE["history"]
-                        }
-                        new_items = []
-                        for ev in filtered:
-                            key = (ev.get("name"), ev.get("protocol"), ev.get("start_time"),
-                                   ev.get("end_time"), ev.get("source"), ev.get("reporter"))
-                            if key not in known:
-                                new_items.append(ev)
-                        if new_items:
-                            STATE["history"][0:0] = new_items
-                            STATE["history"].sort(key=lambda h: h.get("end_time") or "", reverse=True)
-                            del STATE["history"][MAX_HISTORY:]
+                    _merge_peer_history(await resp.json())
+            except Exception:
+                pass
+            await asyncio.sleep(POLL_INTERVAL)
+
+async def poll_node_status_task(url: str):
+    """Poll one node endpoint (NodePort or Route); key internal_status by node_name from response."""
+    status_url = f"{url.rstrip('/')}/status"
+    history_url = f"{url.rstrip('/')}/history"
+    timeout = aiohttp.ClientTimeout(total=HTTP_TIMEOUT)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        while True:
+            key = url
+            try:
+                async with session.get(status_url) as resp:
+                    resp.raise_for_status()
+                    data = await resp.json()
+                    self_info = data.get("self") or {}
+                    key = self_info.get("node_name") or self_info.get("pod_name") or url
+                    STATE["internal_status"][key] = data
+            except Exception as e:
+                STATE["internal_status"][key] = {"error": str(e), "url": status_url}
+            try:
+                async with session.get(history_url) as resp:
+                    resp.raise_for_status()
+                    _merge_peer_history(await resp.json())
             except Exception:
                 pass
             await asyncio.sleep(POLL_INTERVAL)
@@ -263,7 +296,9 @@ pre{background:#fff;border:1px solid #ddd;padding:15px;border-radius:5px;white-s
 .btn:hover{background:#f0f0f0}
 .btn:disabled{opacity:.6;cursor:not-allowed}
 .header-row{display:flex;align-items:center;justify-content:space-between}
+#mermaid-container{min-height:120px;font-size:14px}
 </style>
+<script src="https://cdn.jsdelivr.net/npm/mermaid/dist/mermaid.min.js"></script>
 </head>
 <body>
 <h1>Live Migration Dashboard</h1>
@@ -278,12 +313,13 @@ pre{background:#fff;border:1px solid #ddd;padding:15px;border-radius:5px;white-s
   </div>
 
   <div class="section">
-    <h2>Internal Status – WebSocket (Pod ↔ Pod)</h2>
-    <table><thead><tr><th>Source Pod</th><th>→ peer-1-svc</th><th>→ peer-2-svc</th><th>→ peer-3-svc</th></tr></thead><tbody id="internal-ws-body"></tbody></table>
+    <h2>Connectivity graph</h2>
+    <div id="mermaid-container" class="mermaid"></div>
+  </div>
+
+  <div class="section">
     <h2>Internal Status – TCP (Pod ↔ Pod)</h2>
-    <table><thead><tr><th>Source Pod</th><th>→ peer-1-svc</th><th>→ peer-2-svc</th><th>→ peer-3-svc</th></tr></thead><tbody id="internal-tcp-body"></tbody></table>
-    <h2>Internal Status – HTTP (Pod ↔ Pod)</h2>
-    <table><thead><tr><th>Source Pod</th><th>→ peer-1-svc</th><th>→ peer-2-svc</th><th>→ peer-3-svc</th></tr></thead><tbody id="internal-http-body"></tbody></table>
+    <table id="internal-tcp-table"><thead><tr id="internal-tcp-head"><th>Source</th></tr></thead><tbody id="internal-tcp-body"></tbody></table>
   </div>
 </div>
 
@@ -299,31 +335,70 @@ pre{background:#fff;border:1px solid #ddd;padding:15px;border-radius:5px;white-s
 const get=(o,p,d=null)=>{try{return p.split('.').reduce((a,k)=>(a&&a[k]!==undefined)?a[k]:undefined,o)??d}catch(_){return d}};
 function cell(s,t){let c='status-unknown';if(s==='connected')c='status-ok';else if(s==='error')c='status-error';return `<td class="${c}">${t}</td>`;}
 
-function renderMetalLBMatrix(ext){const tb=document.getElementById('metallb-matrix-body');let h='';for(let i=1;i<=3;i++){const httpS=get(ext,`peer-${i}-lb (HTTP).status`,'unknown');const wsS=get(ext,`peer-${i}-lb (WS).status`,'unknown');const tcpS=get(ext,`peer-${i}-lb (TCP).status`,'unknown');h+='<tr>';h+=`<td><b>Peer-${i} (LoadBalancer)</b></td>`;h+=cell(httpS,httpS)+cell(wsS,wsS)+cell(tcpS,tcpS);h+='</tr>';}tb.innerHTML=h;}
-function renderExternalMatrix(ext){const tb=document.getElementById('external-matrix-body');let h='';for(let i=1;i<=3;i++){const httpS=get(ext,`peer-${i}-np (HTTP).status`,'unknown');const wsS=get(ext,`peer-${i}-np (WS).status`,'unknown');const tcpS=get(ext,`peer-${i}-np (TCP).status`,'unknown');h+='<tr>';h+=`<td><b>Peer-${i} (NodePort)</b></td>`;h+=cell(httpS,httpS)+cell(wsS,wsS)+cell(tcpS,tcpS);h+='</tr>';}tb.innerHTML=h;}
-function renderRouteMatrix(ext){const tb=document.getElementById('route-matrix-body');let h='';for(let i=1;i<=3;i++){const name=`peer-${i}-route`;const pingS=get(ext,`${name} (HTTP).status`,'unknown');h+='<tr>';h+=`<td><b>${name}</b></td>`;h+=cell(pingS,pingS);h+='</tr>';}tb.innerHTML=h;}
+function renderMetalLBMatrix(ext){const tb=document.getElementById('metallb-matrix-body');if(!tb)return;const keys=Object.keys(ext||{}).filter(k=>k.includes('lb'));let h='';keys.forEach(k=>{const base=k.replace(' (HTTP)','').replace(' (WS)','').replace(' (TCP)','');const httpS=get(ext,base+' (HTTP).status','unknown');const wsS=get(ext,base+' (WS).status','unknown');const tcpS=get(ext,base+' (TCP).status','unknown');h+='<tr>';h+=`<td><b>${base}</b></td>`;h+=cell(httpS,httpS)+cell(wsS,wsS)+cell(tcpS,tcpS);h+='</tr>';});tb.innerHTML=h||'<tr><td>No data</td></tr>';}
+function renderExternalMatrix(ext){const tb=document.getElementById('external-matrix-body');if(!tb)return;const keys=Object.keys(ext||{}).filter(k=>k.includes('np'));let h='';keys.forEach(k=>{const base=k.replace(' (HTTP)','').replace(' (WS)','').replace(' (TCP)','');const httpS=get(ext,base+' (HTTP).status','unknown');const wsS=get(ext,base+' (WS).status','unknown');const tcpS=get(ext,base+' (TCP).status','unknown');h+='<tr>';h+=`<td><b>${base}</b></td>`;h+=cell(httpS,httpS)+cell(wsS,wsS)+cell(tcpS,tcpS);h+='</tr>';});tb.innerHTML=h||'<tr><td>No data</td></tr>';}
+function renderRouteMatrix(ext){const tb=document.getElementById('route-matrix-body');if(!tb)return;const keys=Object.keys(ext||{}).filter(k=>k.endsWith(' (HTTP)')||k.includes('Router'));let h='';keys.forEach(k=>{const name=k.replace(' (HTTP)','');const pingS=get(ext,k+'.status','unknown');h+='<tr>';h+=`<td><b>${name}</b></td>`;h+=cell(pingS,pingS);h+='</tr>';});tb.innerHTML=h||'<tr><td>No data</td></tr>';}
 
-function renderInternalProto(internal, proto, targetId){
-  const tb=document.getElementById(targetId);let h='';
-  for(let i=1;i<=3;i++){
-    const src=`peer-${i}-route`; const data=internal[src];
-    h+='<tr>'; h+=`<td><b>From Peer-${i}</b></td>`;
-    if(!data||data.error){h+=cell('error','POLL FAILED')+cell('error','POLL FAILED')+cell('error','POLL FAILED');}
-    else{
-      for(let j=1;j<=3;j++){
-        const dest=`peer-${j}-svc`;
-        const s=get(data,`connections.${dest}.${proto}`,'unknown');
-        h+=cell(s,s);
-      }
-    }
-    h+='</tr>';
+function buildNodeToIp(internal, ipToNode){
+  const nodeToIp={};
+  for(const key of Object.keys(internal||{})){
+    const d=internal[key]; if(!d||d.error)continue;
+    const self=d.self; if(!self)continue;
+    const n=self.node_name, p=self.pod_ip; if(n&&p) nodeToIp[n]=p;
   }
-  tb.innerHTML=h;
+  return nodeToIp;
+}
+
+function renderInternalTcp(data){
+  const internal=data.internal_status||{}; const nodeOrder=data.node_order||[]; const ipToNode=data.ip_to_node||{};
+  const thead=document.getElementById('internal-tcp-head'); const tbody=document.getElementById('internal-tcp-body');
+  if(!thead||!tbody)return;
+  const nodeToIp=buildNodeToIp(internal, ipToNode);
+  if(nodeOrder.length===0){thead.innerHTML='<tr><th>Source</th></tr>';tbody.innerHTML='<tr><td>No nodes (set NODE_STATUS_ENDPOINTS)</td></tr>';return;}
+  let headCells='<th>Source</th>'; nodeOrder.forEach(n=>{headCells+=`<th>→ ${n}</th>`;}); thead.innerHTML='<tr>'+headCells+'</tr>';
+  let bodyRows='';
+  nodeOrder.forEach(srcNode=>{
+    const d=internal[srcNode]; bodyRows+=`<tr><td><b>${srcNode}</b></td>`;
+    if(!d||d.error){nodeOrder.forEach(()=>{bodyRows+=cell('error','?');}); bodyRows+='</tr>'; return;}
+    const conn=d.connections||{};
+    nodeOrder.forEach(tgtNode=>{
+      if(tgtNode===srcNode){bodyRows+=`<td class="status-ok">self</td>`; return;}
+      const tgtIp=nodeToIp[tgtNode]; const s=tgtIp?get(conn,tgtIp+'.tcp','unknown'):'unknown';
+      bodyRows+=cell(s,s);
+    });
+    bodyRows+='</tr>';
+  });
+  tbody.innerHTML=bodyRows;
+}
+
+function renderMermaid(data){
+  const nodeOrder=data.node_order||[]; const internal=data.internal_status||{}; const ipToNode=data.ip_to_node||{};
+  const nodeToIp=buildNodeToIp(internal, ipToNode);
+  const container=document.getElementById('mermaid-container'); if(!container)return;
+  if(nodeOrder.length===0){container.textContent='No nodes'; container.removeAttribute('data-processed'); return;}
+  const id=(s)=>String(s).replace(/[^a-zA-Z0-9]/g,'_').replace(/^_/,'')||'n';
+  let lines=['flowchart LR'];
+  nodeOrder.forEach(n=>{lines.push('  '+id(n)+'["'+n+'"]');});
+  for(let i=0;i<nodeOrder.length;i++){
+    for(let j=i+1;j<nodeOrder.length;j++){
+      const src=nodeOrder[i], tgt=nodeOrder[j];
+      const d=internal[src]; const conn=(d&&!d.error&&d.connections)||{};
+      const tgtIp=nodeToIp[tgt]; const s1=tgtIp?conn[tgtIp]?.tcp:'unknown';
+      const d2=internal[tgt]; const conn2=(d2&&!d2.error&&d2.connections)||{};
+      const srcIp=nodeToIp[src]; const s2=srcIp?conn2[srcIp]?.tcp:'unknown';
+      const ok=(s1==='connected'&&s2==='connected');
+      const edge=ok ? ' --- ' : ' -.->|down| ';
+      lines.push('  '+id(src)+edge+id(tgt));
+    }
+  }
+  container.textContent=lines.join('\\n');
+  container.setAttribute('data-processed','false');
+  if(window.mermaid){mermaid.run({nodes:[container], suppressErrors:true}).catch(()=>{});}
 }
 
 function renderHistory(hist){
   const el=document.getElementById('history-log');
-  if(!hist||hist.length===0){el.textContent='No disconnections yet.';return;}
+  if(!el)return; if(!hist||hist.length===0){el.textContent='No disconnections yet.';return;}
   let h=''; for(const ev of hist){
     const src=ev.source||''; let label='';
     if(src==='bastion'){label=`Bastion → ${ev.name||'unknown'}`;}
@@ -345,9 +420,8 @@ async function loop(){
     renderMetalLBMatrix(data.external_tests);
     renderExternalMatrix(data.external_tests);
     renderRouteMatrix(data.external_tests);
-    renderInternalProto(data.internal_status,'ws','internal-ws-body');
-    renderInternalProto(data.internal_status,'tcp','internal-tcp-body');
-    renderInternalProto(data.internal_status,'http','internal-http-body');
+    renderInternalTcp(data);
+    renderMermaid(data);
     renderHistory(data.history);
   }catch(e){
     document.getElementById('timestamp').innerText='Error fetching data: '+e;
@@ -377,17 +451,42 @@ loop(); setInterval(loop,1000);
 </html>
 """
 
+# ---------- API helpers ----------
+def _build_node_order_and_ip_map():
+    """From internal_status build sorted node list and pod_ip -> node_name map."""
+    nodes_set = set()
+    ip_to_node = {}
+    for _key, data in STATE["internal_status"].items():
+        if not isinstance(data, dict) or "error" in data:
+            continue
+        self_info = data.get("self") or {}
+        node_name = self_info.get("node_name")
+        pod_ip = self_info.get("pod_ip")
+        if node_name:
+            nodes_set.add(node_name)
+            if pod_ip:
+                ip_to_node[pod_ip] = node_name
+    return sorted(nodes_set), ip_to_node
+
 # ---------- Routes ----------
 async def handle_html(_): return web.Response(text=HTML_PAGE, content_type="text/html")
-async def handle_api(_):  return web.json_response(STATE)
+
+async def handle_api(_):
+    """Return STATE plus computed node_order and ip_to_node for dynamic dashboard."""
+    node_order, ip_to_node = _build_node_order_and_ip_map()
+    payload = {**STATE, "node_order": node_order, "ip_to_node": ip_to_node}
+    return web.json_response(payload)
+
 async def handle_health(_): return web.Response(text="ok", content_type="text/plain")
 
 async def _fanout_clear_to_peers():
+    """POST /admin/clear_history to every node endpoint (NODE_STATUS_ENDPOINTS)."""
+    urls = NODE_STATUS_ENDPOINTS if NODE_STATUS_ENDPOINTS else ROUTE_PEERS
     timeout = aiohttp.ClientTimeout(total=2.0)
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        for url in ROUTE_PEERS:
+        for url in urls:
             try:
-                async with session.post(f"{url}/admin/clear_history") as resp:
+                async with session.post(f"{url.rstrip('/')}/admin/clear_history") as resp:
                     await resp.text()
                     logging.info(f"[CLEAR] peer ok: {url}")
             except Exception as e:
@@ -405,6 +504,18 @@ async def handle_clear_history(_):
 # ---------- Probe supervisor ----------
 async def run_probes():
     tasks = []
+    # Per-node status (primary): one poll task per NODE_STATUS_ENDPOINTS URL
+    for url in NODE_STATUS_ENDPOINTS:
+        tasks.append(asyncio.create_task(poll_node_status_task(url)))
+    # Optional: router test via ROUTE_STATUS_ENDPOINTS (one HTTP ping per node)
+    for i, url in enumerate(ROUTE_STATUS_ENDPOINTS):
+        tasks.append(asyncio.create_task(http_client_task(f"Router-{i}", url)))
+    # Legacy: ROUTE_PEERS (poll by name)
+    for i, url in enumerate(ROUTE_PEERS, 1):
+        rname = f"peer-{i}-route"
+        tasks += [asyncio.create_task(http_client_task(rname, url)),
+                  asyncio.create_task(poll_peer_status_task(rname, url))]
+    # Optional: MetalLB / NodePort external tests
     for name, ip in METALLB_PEERS.items():
         tasks += [asyncio.create_task(ws_client_task(name, ip, 8080)),
                   asyncio.create_task(tcp_client_task(name, ip, 8081)),
@@ -413,10 +524,6 @@ async def run_probes():
         tasks += [asyncio.create_task(ws_client_task(name, cfg["host"], cfg["ws_port"])),
                   asyncio.create_task(tcp_client_task(name, cfg["host"], cfg["tcp_port"])),
                   asyncio.create_task(http_client_task(name, f"http://{cfg['host']}:{cfg['http_port']}"))]
-    for i, url in enumerate(ROUTE_PEERS, 1):
-        rname = f"peer-{i}-route"
-        tasks += [asyncio.create_task(http_client_task(rname, url)),
-                  asyncio.create_task(poll_peer_status_task(rname, url))]
     await asyncio.gather(*tasks)
 
 # ---------- Main ----------

@@ -1,0 +1,18 @@
+# Deployment config for migration-test-system
+# Copy to deploy.conf and set values. Override with CLI: -r REGISTRY -n NAMESPACE
+
+# Required: image registry (e.g. for airgapped transfer)
+REGISTRY=registry.example.com:5000
+
+# Required: target namespace
+NAMESPACE=migration-test-system
+
+# Optional: image tag and name
+IMAGE_TAG=latest
+PEER_APP_IMAGE=applications/peer-app
+
+# Optional: NodePort service name (used to read port)
+NODE_PORT_SVC_NAME=migration-peer-nodeport
+
+# Optional: apps domain for route hosts (OpenShift); if empty, routes get default host
+# ROUTE_HOST_BASE=apps.cluster.example.com

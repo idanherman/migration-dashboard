@@ -6,27 +6,24 @@ A comprehensive monitoring dashboard for tracking connectivity during OVN (Open 
 
 The system consists of three main components:
 
-1. **Bastion Client** (`bastion-peer/`) - Runs outside the cluster, tests external connectivity
-2. **Peer Application** (`ocp-peer/`) - Runs inside cluster pods, tests pod-to-pod connectivity
+1. **Bastion Client** (`bastion-peer/`) - Runs outside the cluster, polls per-node status and optional external tests
+2. **Peer Application** (`ocp-peer/`) - Runs as a DaemonSet (one pod per node), TCP-only pod-to-pod mesh
 3. **Dashboard** (`dashboard/`) - Alternative simpler dashboard (optional)
 
 ## Components
 
 ### Bastion Client
-- Tests connectivity from bastion host to cluster via:
-  - MetalLB LoadBalancer IPs (HTTP, WebSocket, TCP)
-  - NodePort services (HTTP, WebSocket, TCP)
-  - OpenShift Routes (HTTP)
-- Polls peer status endpoints
-- Provides web dashboard on port 9091
-- Tracks disconnection history
+- **Primary**: Polls **NODE_STATUS_ENDPOINTS** (one URL per node via NodePort with `externalTrafficPolicy: Local`) for `/status` and `/history`; builds a dynamic N×N connectivity matrix and optional **Mermaid connectivity graph**
+- **Optional**: **ROUTE_STATUS_ENDPOINTS** to test OpenShift router per node
+- **Optional**: MetalLB / NodePort / Route external tests (legacy)
+- Clear history fans out to all NODE_STATUS_ENDPOINTS
+- Dashboard on port 9091
 
 ### Peer Application
-- Runs inside cluster pods
-- Implements WS/TCP/HTTP servers
-- Connects to other peer services (pod-to-pod)
-- Tracks connection state and outages
-- Exposes `/status` and `/history` endpoints
+- Runs as a **DaemonSet** (one pod per node); discovers peers via **headless Service** DNS
+- **TCP-only** pod-to-pod connectivity checks (configurable interval)
+- HTTP server for `/status`, `/history`, `/ping`, `/admin/clear_history`
+- `/status` returns `self` (pod_name, pod_ip, node_name) and `connections` keyed by peer IP
 
 ## Prerequisites
 
@@ -86,26 +83,21 @@ podman load -i migration-dashboard-images.tar
 
 ### 3. Configure for Your Environment
 
-#### Update Kubernetes Manifests
+#### Deploy with script (recommended)
 
-1. **Update image registry** in deployment files:
-   ```yaml
-   # In deployment-peer-*.yaml
-   image: your-registry.example.com:5000/applications/peer-app:latest
+1. Copy and edit deploy config:
+   ```bash
+   cp scripts/deploy.conf.example deploy.conf
+   # Set REGISTRY= (e.g. local registry for airgap), NAMESPACE=migration-test-system
    ```
 
-2. **Update namespace** (if different):
-   ```yaml
-   metadata:
-     namespace: your-namespace
+2. Deploy (substitutes REGISTRY/NAMESPACE in manifests, applies DaemonSet + headless + NodePort, syncs Routes per node):
+   ```bash
+   ./scripts/deploy.sh -c deploy.conf
+   # Or override: ./scripts/deploy.sh -r my-registry:5000 -n migration-test-system
    ```
 
-3. **Configure node selectors** (if needed):
-   ```yaml
-   spec:
-     nodeSelector:
-       kubernetes.io/hostname: your-worker-node
-   ```
+3. Paste the script output (`NODE_STATUS_ENDPOINTS` and optionally `ROUTE_STATUS_ENDPOINTS`) into bastion `config.env`.
 
 #### Configure Bastion Client
 
@@ -114,10 +106,7 @@ podman load -i migration-dashboard-images.tar
    cp source/bastion-peer/config.example.env source/bastion-peer/config.env
    ```
 
-2. Edit `config.env` with your environment values:
-   - MetalLB IPs
-   - NodePort configurations
-   - Route URLs
+2. Set **NODE_STATUS_ENDPOINTS** (and optionally **ROUTE_STATUS_ENDPOINTS**) from the deploy script output. Optionally set MetalLB/NodePort/Route for external tests.
    - Test intervals
 
 3. Use configuration:
@@ -135,106 +124,62 @@ python source/bastion-peer/bastion-client.py
 
 ### 4. Deploy to Cluster
 
-```bash
-# Create namespace (if needed)
-oc create namespace migration-test-system
-
-# Deploy services
-oc apply -f source/ocp-peer/service-peer-1.yaml
-oc apply -f source/ocp-peer/service-peer-2.yaml
-oc apply -f source/ocp-peer/service-peer-3.yaml
-
-# Deploy peer applications
-oc apply -f source/ocp-peer/deployment-peer-1.yaml
-oc apply -f source/ocp-peer/deployment-peer-2.yaml
-oc apply -f source/ocp-peer/deployment-peer-3.yaml
-
-# Verify deployments
-oc get pods -n migration-test-system
-oc get svc -n migration-test-system
-```
-
-### 5. Configure Routes (OpenShift)
-
-If using OpenShift Routes, create routes for each peer service:
+Use the deploy script (config file + CLI overrides for REGISTRY and NAMESPACE):
 
 ```bash
-oc expose svc peer-1-svc -n migration-test-system --name=peer-1-route
-oc expose svc peer-2-svc -n migration-test-system --name=peer-2-route
-oc expose svc peer-3-svc -n migration-test-system --name=peer-3-route
+oc create namespace migration-test-system   # if needed
+cp scripts/deploy.conf.example deploy.conf
+# Edit deploy.conf: REGISTRY=..., NAMESPACE=migration-test-system
+
+./scripts/deploy.sh -c deploy.conf
+# Or: ./scripts/deploy.sh -r my-registry:5000 -n migration-test-system
 ```
 
-Get route URLs:
-```bash
-oc get routes -n migration-test-system
-```
+The script applies the DaemonSet, headless Service, NodePort Service, waits for pods, labels pods with `node-name`, creates one Service and one Route per node (for router test), then prints **NODE_STATUS_ENDPOINTS** and **ROUTE_STATUS_ENDPOINTS**. Paste those into bastion `config.env`.
 
-Update `ROUTE_PEERS` in bastion client configuration.
+**When nodes are added or removed:** Re-run `./scripts/deploy.sh -c deploy.conf` (or `--sync-routes` only to update Routes), then update NODE_STATUS_ENDPOINTS and ROUTE_STATUS_ENDPOINTS in bastion config and restart the bastion. The in-cluster mesh self-heals via DNS.
 
-### 6. Configure MetalLB (if using)
-
-1. Get LoadBalancer IPs:
-   ```bash
-   oc get svc -n migration-test-system
-   ```
-
-2. Update `METALLB_PEERS` in bastion client configuration.
-
-### 7. Configure NodePort (if using)
-
-1. Get NodePort ports:
-   ```bash
-   oc get svc -n migration-test-system -o yaml
-   ```
-
-2. Update `NODEPORT_PEERS` in bastion client configuration with:
-   - Node IPs
-   - NodePort numbers for each service
-
-### 8. Run Bastion Client
+### 5. Run Bastion Client
 
 ```bash
 # Using environment file
 export $(cat source/bastion-peer/config.env | xargs)
 python source/bastion-peer/bastion-client.py
 
-# Or using container
+# Or using container (set NODE_STATUS_ENDPOINTS from deploy script output)
 podman run -d \
   --name migration-dashboard \
   -p 9091:9091 \
-  -e METALLB_PEERS='{"peer-1-lb": "10.0.0.1", ...}' \
-  -e ROUTE_PEERS="http://peer-1-route.example.com,..." \
+  -e NODE_STATUS_ENDPOINTS="http://node1:30082,http://node2:30082,..." \
   your-registry.example.com:5000/applications/bastion-client:latest
 ```
 
-Access dashboard at: `http://localhost:9091`
+Access dashboard at: `http://localhost:9091`. The dashboard shows a **dynamic N×N** connectivity matrix (by node) and a **Mermaid connectivity graph** that updates with the data.
 
 ## Configuration Reference
 
 ### Bastion Client Environment Variables
 
-| Variable | Description | Default | Format |
-|----------|-------------|---------|--------|
-| `METALLB_PEERS` | MetalLB LoadBalancer IPs | See example | JSON object |
-| `NODEPORT_PEERS` | NodePort configurations | See example | JSON object |
-| `ROUTE_PEERS` | HTTP Route URLs | See example | Comma-separated |
-| `HTTP_INTERVAL` | HTTP test interval (seconds) | 1.0 | Float |
-| `WS_INTERVAL` | WebSocket test interval (seconds) | 0.5 | Float |
-| `TCP_INTERVAL` | TCP test interval (seconds) | 0.5 | Float |
-| `POLL_INTERVAL` | Status poll interval (seconds) | 1.0 | Float |
-| `RECONNECT_DELAY` | Reconnect delay (seconds) | 1.0 | Float |
-| `HTTP_TIMEOUT` | HTTP timeout (seconds) | 1.0 | Float |
-| `WS_OPEN_TIMEOUT` | WebSocket open timeout (seconds) | 1.0 | Float |
-| `TCP_CONNECT_TIMEOUT` | TCP connect timeout (seconds) | 1.0 | Float |
-| `DASHBOARD_PORT` | Dashboard web port | 9091 | Integer |
-| `MAX_HISTORY` | Max history entries | 200 | Integer |
+| Variable | Description | Format |
+|----------|-------------|--------|
+| `NODE_STATUS_ENDPOINTS` | Per-node URLs (NodePort Local); required for internal status | Comma-separated |
+| `ROUTE_STATUS_ENDPOINTS` | Per-node URLs via Route (router test); optional | Comma-separated |
+| `METALLB_PEERS` | MetalLB IPs (optional external test) | JSON object |
+| `NODEPORT_PEERS` | NodePort config (optional) | JSON object |
+| `ROUTE_PEERS` | Legacy route URLs (optional) | Comma-separated |
+| `POLL_INTERVAL` | Status poll interval (seconds) | Float |
+| `DASHBOARD_PORT` | Dashboard web port | Integer |
+| `MAX_HISTORY` | Max history entries | Integer |
 
-### Peer Application Environment Variables
+### Peer Application (DaemonSet) Environment Variables
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `PEERS` | Comma-separated peer service names | `peer-1-svc,peer-2-svc,peer-3-svc` |
-| `HOSTNAME` | Pod hostname (auto-set from metadata) | Pod name |
+| `PEER_SERVICE` | Headless service name for peer discovery | `migration-peer-svc` |
+| `NAMESPACE` | Namespace (downward API) | - |
+| `POD_IP`, `NODE_NAME`, `HOSTNAME` | Set from downward API | - |
+| `CHECK_INTERVAL` | TCP check interval (seconds) | 10.0 |
+| `PEER_RESOLVE_INTERVAL` | DNS re-resolve interval (seconds) | 60.0 |
 
 ## Building Images with Offline Dependencies
 

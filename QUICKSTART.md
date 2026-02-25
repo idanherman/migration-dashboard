@@ -11,26 +11,21 @@
 ### 2. Deploy to Cluster
 ```bash
 oc create namespace migration-test-system
-oc apply -f source/ocp-peer/service-peer-*.yaml
-oc apply -f source/ocp-peer/deployment-peer-*.yaml
+cp scripts/deploy.conf.example deploy.conf
+# Edit deploy.conf: REGISTRY=..., NAMESPACE=migration-test-system
+./scripts/deploy.sh -c deploy.conf
 ```
+Copy the printed **NODE_STATUS_ENDPOINTS** (and **ROUTE_STATUS_ENDPOINTS**) into bastion config.
 
-### 3. Create Routes
-```bash
-oc expose svc peer-1-svc -n migration-test-system --name=peer-1-route
-oc expose svc peer-2-svc -n migration-test-system --name=peer-2-route
-oc expose svc peer-3-svc -n migration-test-system --name=peer-3-route
-```
-
-### 4. Configure and Run Bastion Client
+### 3. Configure and Run Bastion Client
 ```bash
 cp source/bastion-peer/config.example.env source/bastion-peer/config.env
-# Edit config.env with your values
+# Set NODE_STATUS_ENDPOINTS (and optionally ROUTE_STATUS_ENDPOINTS) from deploy script output
 export $(cat source/bastion-peer/config.env | xargs)
 python source/bastion-peer/bastion-client.py
 ```
 
-Access dashboard at: http://localhost:9091
+Access dashboard at: http://localhost:9091 (dynamic N×N matrix and Mermaid connectivity graph).
 
 ## For Airgapped Environments
 
@@ -52,47 +47,37 @@ podman load -i images.tar
 ./push-images.sh local-registry.example.com:5000 v1.0.0 applications
 ```
 
-### 4. Update Manifests
-- Update image registry in `deployment-peer-*.yaml`
-- Update namespace if needed
-
-### 5. Deploy and Configure
-Follow steps 2-4 from "For Connected Environments" above.
+### 4. Deploy and Configure
+- Set REGISTRY and NAMESPACE in `deploy.conf` (or use `-r` / `-n` when running the script).
+- Run `./scripts/deploy.sh -c deploy.conf`; paste NODE_STATUS_ENDPOINTS and ROUTE_STATUS_ENDPOINTS into bastion config.
+- Follow step 3 from "For Connected Environments" to run the bastion.
 
 ## Configuration Quick Reference
 
-### Bastion Client Environment Variables
+### Bastion Client (required for internal status)
 ```bash
-export METALLB_PEERS='{"peer-1-lb": "IP1", "peer-2-lb": "IP2", "peer-3-lb": "IP3"}'
-export ROUTE_PEERS="http://route1,http://route2,http://route3"
+# From deploy script output
+export NODE_STATUS_ENDPOINTS="http://node1:30082,http://node2:30082,..."
+export ROUTE_STATUS_ENDPOINTS="https://migration-peer-node1-....apps...,..."   # optional, router test
 export DASHBOARD_PORT=9091
 ```
 
-### Get Values from Cluster
-```bash
-# MetalLB IPs
-oc get svc -n migration-test-system -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.loadBalancer.ingress[0].ip}{"\n"}{end}'
-
-# Route URLs
-oc get routes -n migration-test-system -o jsonpath='{range .items[*]}{.spec.host}{"\n"}{end}'
-```
+### Node add/remove
+After adding or removing cluster nodes, re-run `./scripts/deploy.sh -c deploy.conf` (or `--sync-routes`), update NODE_STATUS_ENDPOINTS and ROUTE_STATUS_ENDPOINTS in bastion config, then restart the bastion. The in-cluster mesh self-heals via DNS.
 
 ## Common Commands
 
 ```bash
-# Check pods
-oc get pods -n migration-test-system
+# Check DaemonSet pods
+oc get pods -n migration-test-system -l app=migration-peer
 
 # Check services
 oc get svc -n migration-test-system
 
-# View logs
-oc logs -f deployment/peer-1 -n migration-test-system
+# View logs (any peer pod)
+oc logs -f -l app=migration-peer -n migration-test-system
 
-# Restart deployment
-oc rollout restart deployment/peer-1 -n migration-test-system
-
-# Scale deployment
-oc scale deployment/peer-1 --replicas=5 -n migration-test-system
+# Re-sync routes only (e.g. after node add/remove)
+./scripts/deploy.sh -c deploy.conf --sync-routes
 ```
 

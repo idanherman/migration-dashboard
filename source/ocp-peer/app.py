@@ -1,7 +1,5 @@
-# app.py — peer: WS/TCP/HTTP servers + clients + status/history + admin clear endpoint
+# app.py — peer: TCP server + clients (mesh), HTTP server for /status, /history, /ping, /admin/clear
 import asyncio
-import websockets
-import aiohttp
 import socket
 import logging
 import os
@@ -11,59 +9,84 @@ import json
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(message)s')
 
 # ---------- Config ----------
-PEERS = os.getenv("PEERS", "peer-1-svc,peer-2-svc,peer-3-svc").split(',')
-WS_PORT = 8080
 TCP_PORT = 8081
 HTTP_PORT = 8082
 
-WS_INTERVAL = 0.1
-WS_PONG_TIMEOUT = WS_INTERVAL + 0.3
-TCP_INTERVAL = 0.1
-HTTP_INTERVAL = 0.5
-RECONNECT_DELAY = 1.0
-
+PEER_SERVICE = os.getenv("PEER_SERVICE", "migration-peer-svc")
+NAMESPACE = os.getenv("NAMESPACE", "migration-test-system")
+POD_IP = os.getenv("POD_IP", "")
 POD_NAME = os.getenv("HOSTNAME", socket.gethostname())
-def now_iso(): return datetime.now(timezone.utc).isoformat()
+NODE_NAME = os.getenv("NODE_NAME", "")
 
-# ---------- State ----------
-connection_state = {
-    peer: {"ws": "unknown", "tcp": "unknown", "http": "unknown", "last_change": ""} for peer in PEERS
-}
-HISTORY = []
+CHECK_INTERVAL = float(os.getenv("CHECK_INTERVAL", "10.0"))
+RECONNECT_DELAY = float(os.getenv("RECONNECT_DELAY", "1.0"))
+PEER_RESOLVE_INTERVAL = float(os.getenv("PEER_RESOLVE_INTERVAL", "60.0"))
+
 MAX_HISTORY = 200
 
-# ---------- Servers ----------
-async def ws_server(websocket):
-    try:
-        async for _ in websocket:
-            pass
-    except Exception as e:
-        logging.info(f"[WS Server] Disconnected: {e}")
+def now_iso():
+    return datetime.now(timezone.utc).isoformat()
 
+# ---------- Peer discovery (DNS) ----------
+def _resolve_peer_ips_sync():
+    fqdn = f"{PEER_SERVICE}.{NAMESPACE}.svc.cluster.local"
+    try:
+        infos = socket.getaddrinfo(fqdn, None, socket.AF_INET)
+        return [info[4][0] for info in infos]
+    except Exception as e:
+        logging.warning(f"DNS resolve failed for {fqdn}: {e}")
+        return []
+
+async def resolve_peer_ips():
+    loop = asyncio.get_event_loop()
+    all_ips = await loop.run_in_executor(None, _resolve_peer_ips_sync)
+    peers = [ip for ip in all_ips if ip != POD_IP]
+    return peers
+
+# ---------- State ----------
+# connection_state keyed by peer IP; value: {"tcp": "connected"|"disconnected"|"unknown", "last_change": "<iso>"}
+connection_state = {}
+# peer_tasks: peer_ip -> asyncio.Task (tcp_client_task)
+peer_tasks = {}
+HISTORY = []
+
+# ---------- Servers ----------
 async def handle_tcp(reader, writer):
     try:
         while True:
             data = await reader.readline()
-            if not data: break
-            writer.write(data)  # echo for TCP probe validation
+            if not data:
+                break
+            writer.write(data)
             await writer.drain()
     finally:
-        try: writer.close(); await writer.wait_closed()
-        except Exception: pass
+        try:
+            writer.close()
+            await writer.wait_closed()
+        except Exception:
+            pass
 
 async def handle_http(reader, writer):
     try:
         data = await reader.read(4096)
         line0 = data.decode(errors="ignore").splitlines()[0] if data else ""
-        method, path = ("GET","/") if not line0 else (line0.split()[0], line0.split()[1])
-        status = 200
+        method, path = ("GET", "/") if not line0 else (line0.split()[0], line0.split()[1])
         body = ""
 
         if method == "POST" and path == "/admin/clear_history":
             HISTORY.clear()
             body = json.dumps({"ok": True, "pod": POD_NAME, "ts": now_iso()})
         elif method == "GET" and path == "/status":
-            body = json.dumps({"self": POD_NAME, "timestamp": now_iso(), "connections": connection_state})
+            status_body = {
+                "self": {
+                    "pod_name": POD_NAME,
+                    "pod_ip": POD_IP,
+                    "node_name": NODE_NAME,
+                },
+                "timestamp": now_iso(),
+                "connections": connection_state,
+            }
+            body = json.dumps(status_body)
         elif method == "GET" and path == "/history":
             body = json.dumps(HISTORY[-MAX_HISTORY:])
         else:
@@ -74,10 +97,13 @@ async def handle_http(reader, writer):
             "Content-Type: application/json\r\n"
             f"Content-Length: {len(body)}\r\n\r\n{body}"
         )
-        writer.write(resp.encode()); await writer.drain()
+        writer.write(resp.encode())
+        await writer.drain()
     finally:
-        try: writer.close()
-        except Exception: pass
+        try:
+            writer.close()
+        except Exception:
+            pass
 
 # ---------- History helper ----------
 def record_outage(target: str, proto: str, start_time_str: str):
@@ -85,99 +111,110 @@ def record_outage(target: str, proto: str, start_time_str: str):
         start = datetime.fromisoformat(start_time_str)
         end = datetime.now(timezone.utc)
         dur = (end - start).total_seconds()
-        HISTORY.insert(0, {
-            "name": target, "protocol": proto,
-            "start_time": start.isoformat(), "end_time": end.isoformat(),
-            "duration_sec": round(dur, 2),
-            "source": "pod", "reporter": POD_NAME
-        })
+        HISTORY.insert(
+            0,
+            {
+                "name": target,
+                "protocol": proto,
+                "start_time": start.isoformat(),
+                "end_time": end.isoformat(),
+                "duration_sec": round(dur, 2),
+                "source": "pod",
+                "reporter": POD_NAME,
+            },
+        )
         del HISTORY[MAX_HISTORY:]
         logging.info(f"--- OUTAGE ENDED: {target} ({proto}) {dur:.2f}s ---")
     except Exception as e:
         logging.warning(f"[HISTORY] Failed to record outage: {e}")
 
-# ---------- Clients ----------
-async def ws_client_task(target: str):
-    uri = f"ws://{'localhost' if target == POD_NAME else target}:{WS_PORT}"
-    while True:
-        start_time = now_iso()
-        try:
-            async with websockets.connect(uri) as ws:
-                logging.info(f"[WS Client] Connected to {target}")
-                connection_state[target]["ws"] = "connected"; connection_state[target]["last_change"] = now_iso()
-                while True:
-                    await ws.send(f'{{"from":"{POD_NAME}","ts":"{now_iso()}"}}')
-                    pong_waiter = ws.ping()
-                    await asyncio.wait_for(pong_waiter, timeout=WS_PONG_TIMEOUT)
-                    await asyncio.sleep(WS_INTERVAL)
-        except Exception as e:
-            if connection_state[target]["ws"] != "disconnected":
-                logging.info(f"[WS Client] Disconnected from {target}: {e}")
-                connection_state[target]["ws"] = "disconnected"; connection_state[target]["last_change"] = now_iso()
-                record_outage(target, "WS", start_time)
-            await asyncio.sleep(RECONNECT_DELAY)
-
-async def tcp_client_task(target: str):
-    host = "localhost" if target == POD_NAME else target
+# ---------- TCP client (one per peer) ----------
+async def tcp_client_task(peer_ip: str):
     while True:
         start_time = now_iso()
         writer = None
         try:
-            reader, writer = await asyncio.open_connection(host, TCP_PORT)
-            logging.info(f"[TCP Client] Connected to {target}")
-            connection_state[target]["tcp"] = "connected"; connection_state[target]["last_change"] = now_iso()
+            reader, writer = await asyncio.open_connection(peer_ip, TCP_PORT)
+            logging.info(f"[TCP Client] Connected to {peer_ip}")
+            connection_state[peer_ip]["tcp"] = "connected"
+            connection_state[peer_ip]["last_change"] = now_iso()
             while True:
                 line = f"ping from {POD_NAME} at {now_iso()}\n".encode()
-                writer.write(line); await writer.drain()
-                echo = await asyncio.wait_for(reader.readline(), timeout=TCP_INTERVAL + 0.3)
-                if echo != line: raise RuntimeError("TCP echo mismatch")
-                await asyncio.sleep(TCP_INTERVAL)
+                writer.write(line)
+                await writer.drain()
+                echo = await asyncio.wait_for(reader.readline(), timeout=CHECK_INTERVAL + 0.3)
+                if echo != line:
+                    raise RuntimeError("TCP echo mismatch")
+                await asyncio.sleep(CHECK_INTERVAL)
+        except asyncio.CancelledError:
+            if writer:
+                try:
+                    writer.close()
+                    await writer.wait_closed()
+                except Exception:
+                    pass
+            raise
         except Exception as e:
-            if connection_state[target]["tcp"] != "disconnected":
-                logging.info(f"[TCP Client] Disconnected from {target}: {e}")
-                connection_state[target]["tcp"] = "disconnected"; connection_state[target]["last_change"] = now_iso()
-                record_outage(target, "TCP", start_time)
+            if peer_ip in connection_state and connection_state[peer_ip]["tcp"] != "disconnected":
+                logging.info(f"[TCP Client] Disconnected from {peer_ip}: {e}")
+                connection_state[peer_ip]["tcp"] = "disconnected"
+                connection_state[peer_ip]["last_change"] = now_iso()
+                record_outage(peer_ip, "TCP", start_time)
             try:
-                if writer: writer.close(); await writer.wait_closed()
-            except Exception: pass
+                if writer:
+                    writer.close()
+                    await writer.wait_closed()
+            except Exception:
+                pass
             await asyncio.sleep(RECONNECT_DELAY)
 
-async def http_client_task(target: str):
-    base = f"http://{'localhost' if target == POD_NAME else target}:{HTTP_PORT}"
-    timeout = aiohttp.ClientTimeout(total=1.0)
-    conn = {"status": "unknown", "since": now_iso()}
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        while True:
-            try:
-                async with session.get(f"{base}/ping") as resp:
-                    resp.raise_for_status()
-                    if conn["status"] == "error":
-                        record_outage(target, "HTTP", conn["since"])
-                    conn["status"] = "connected"; conn["since"] = now_iso()
-                    connection_state[target]["http"] = "connected"; connection_state[target]["last_change"] = now_iso()
-            except Exception:
-                if conn["status"] != "error":
-                    conn["status"] = "error"; conn["since"] = now_iso()
-                connection_state[target]["http"] = "disconnected"; connection_state[target]["last_change"] = now_iso()
-            await asyncio.sleep(HTTP_INTERVAL)
+# ---------- Peer discovery loop: re-resolve DNS and add/remove client tasks ----------
+async def peer_discovery_loop():
+    global connection_state, peer_tasks
+    while True:
+        try:
+            new_peers = await resolve_peer_ips()
+            new_set = set(new_peers)
+            current_set = set(connection_state.keys())
+
+            removed = current_set - new_set
+            for ip in removed:
+                if ip in peer_tasks:
+                    peer_tasks[ip].cancel()
+                    try:
+                        await peer_tasks[ip]
+                    except asyncio.CancelledError:
+                        pass
+                    del peer_tasks[ip]
+                connection_state.pop(ip, None)
+
+            added = new_set - current_set
+            for ip in added:
+                connection_state[ip] = {"tcp": "unknown", "last_change": now_iso()}
+                peer_tasks[ip] = asyncio.create_task(tcp_client_task(ip))
+
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logging.warning(f"[Discovery] Error: {e}")
+        await asyncio.sleep(PEER_RESOLVE_INTERVAL)
 
 # ---------- Main ----------
 async def main():
-    ws_srv = websockets.serve(ws_server, "0.0.0.0", WS_PORT)
+    # Initial resolve and start TCP clients
+    initial_peers = await resolve_peer_ips()
+    for ip in initial_peers:
+        connection_state[ip] = {"tcp": "unknown", "last_change": now_iso()}
+        peer_tasks[ip] = asyncio.create_task(tcp_client_task(ip))
+
     tcp_srv = asyncio.start_server(handle_tcp, "0.0.0.0", TCP_PORT)
     http_srv = asyncio.start_server(handle_http, "0.0.0.0", HTTP_PORT)
+    discovery_task = asyncio.create_task(peer_discovery_loop())
 
-    tasks = []
-    for p in connection_state:
-        tasks += [asyncio.create_task(ws_client_task(p)),
-                  asyncio.create_task(tcp_client_task(p)),
-                  asyncio.create_task(http_client_task(p))]
-
-    await asyncio.gather(ws_srv, tcp_srv, http_srv, *tasks, return_exceptions=True)
+    await asyncio.gather(tcp_srv, http_srv, discovery_task)
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
         logging.info("Peer app shutting down.")
-
