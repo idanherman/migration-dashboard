@@ -15,8 +15,8 @@ COPY app.py /app/
 # Clean up any old Python cache files to ensure the new code is used
 RUN find . -type f -name "*.py[co]" -delete -o -type d -name "__pycache__" -delete
 
-# Expose ports
-EXPOSE 8081 8082
+# Expose ports (WS, TCP, HTTP)
+EXPOSE 8080 8081 8082
 
 CMD ["python", "app.py"]
 

@@ -1,1 +1,2 @@
-# TCP-only peer app: no aiohttp/websockets (raw asyncio for HTTP server)
+# Peer app: TCP + HTTP + WebSocket (for bastion external probes)
+websockets>=12.0

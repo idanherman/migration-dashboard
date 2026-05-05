@@ -7,7 +7,7 @@ A comprehensive monitoring dashboard for tracking connectivity during OVN (Open 
 The system consists of three main components:
 
 1. **Bastion Client** (`bastion-peer/`) - Runs outside the cluster, polls per-node status and optional external tests
-2. **Peer Application** (`ocp-peer/`) - Runs as a DaemonSet (one pod per node), TCP-only pod-to-pod mesh
+2. **Peer Application** (`ocp-peer/`) - Runs as a DaemonSet (one pod per node): TCP mesh, HTTP :8082, WebSocket :8080 for bastion external probes
 3. **Dashboard** (`dashboard/`) - Alternative simpler dashboard (optional)
 
 ## Components
@@ -21,9 +21,10 @@ The system consists of three main components:
 
 ### Peer Application
 - Runs as a **DaemonSet** (one pod per node); discovers peers via **headless Service** DNS
-- **TCP-only** pod-to-pod connectivity checks (configurable interval)
+- **TCP** pod-to-pod mesh (configurable interval); **HTTP** on 8082; **WebSocket** on 8080 (for bastion external “LoadBalancer / NodePort” WS probes)
 - HTTP server for `/status`, `/history`, `/ping`, `/admin/clear_history`
 - `/status` returns `self` (pod_name, pod_ip, node_name) and `connections` keyed by peer IP
+- **NodePort Service** publishes 8080/8081/8082. Optional **per-node LoadBalancers** (`migration-peer-lb-<node>`): set `APPLY_LOADBALANCER=yes` in `deploy.conf` if the cluster has MetalLB (or cloud LB); `deploy.sh` then prints `METALLB_PEERS` JSON for the bastion
 
 ## Prerequisites
 
@@ -153,6 +154,8 @@ podman run -d \
   -e NODE_STATUS_ENDPOINTS="http://node1:30082,http://node2:30082,..." \
   your-registry.example.com:5000/applications/bastion-client:latest
 ```
+
+If you use `--env-file`, it must be **`KEY=value` lines only** (see `source/bastion-peer/config.podman.example.env`). Files with `export KEY=value` break Podman: variables become named `export KEY`, so the app ignores them.
 
 Access dashboard at: `http://localhost:9091`. The dashboard shows a **dynamic N×N** connectivity matrix (by node) and a **Mermaid connectivity graph** that updates with the data.
 

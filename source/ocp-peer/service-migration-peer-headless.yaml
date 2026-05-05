@@ -8,6 +8,9 @@ spec:
   selector:
     app: migration-peer
   ports:
+    - port: 8080
+      targetPort: 8080
+      name: ws
     - port: 8081
       targetPort: 8081
       name: tcp

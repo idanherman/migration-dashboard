@@ -1,4 +1,4 @@
-# app.py — peer: TCP server + clients (mesh), HTTP server for /status, /history, /ping, /admin/clear
+# app.py — peer: TCP server + clients (mesh), HTTP server for /status, /history, /ping, /admin/clear, WebSocket :8080 for bastion probes
 import asyncio
 import socket
 import logging
@@ -6,9 +6,12 @@ import os
 from datetime import datetime, timezone
 import json
 
+import websockets
+
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(message)s')
 
 # ---------- Config ----------
+WS_PORT = 8080
 TCP_PORT = 8081
 HTTP_PORT = 8082
 
@@ -65,6 +68,20 @@ async def handle_tcp(reader, writer):
             await writer.wait_closed()
         except Exception:
             pass
+
+async def ws_handler(websocket):
+    """Minimal handler; protocol ping/pong is answered by the library (bastion uses ws.ping())."""
+    try:
+        async for _ in websocket:
+            pass
+    except Exception:
+        pass
+
+
+async def ws_serve_forever():
+    async with websockets.serve(ws_handler, "0.0.0.0", WS_PORT):
+        await asyncio.Future()
+
 
 async def handle_http(reader, writer):
     try:
@@ -210,8 +227,9 @@ async def main():
     tcp_srv = asyncio.start_server(handle_tcp, "0.0.0.0", TCP_PORT)
     http_srv = asyncio.start_server(handle_http, "0.0.0.0", HTTP_PORT)
     discovery_task = asyncio.create_task(peer_discovery_loop())
+    ws_task = asyncio.create_task(ws_serve_forever())
 
-    await asyncio.gather(tcp_srv, http_srv, discovery_task)
+    await asyncio.gather(tcp_srv, http_srv, discovery_task, ws_task)
 
 if __name__ == "__main__":
     try:

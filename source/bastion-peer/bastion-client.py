@@ -4,10 +4,12 @@ import aiohttp
 import websockets
 import logging
 import socket
+import ssl as ssl_module
 import os
 import json
 from datetime import datetime, timezone
-from aiohttp import web
+from typing import Union
+from aiohttp import web, TCPConnector
 
 # Initialize logging early
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(message)s')
@@ -64,6 +66,9 @@ def load_config():
     config["DASHBOARD_PORT"] = int(os.getenv("DASHBOARD_PORT", "9091"))
     config["MAX_HISTORY"] = int(os.getenv("MAX_HISTORY", "200"))
     
+    # SSL verification for HTTPS (e.g. OpenShift routes with self-signed cert). Set to false to skip.
+    config["SSL_VERIFY"] = os.getenv("SSL_VERIFY", "true").lower() not in ("0", "false", "no")
+    
     return config
 
 CONFIG = load_config()
@@ -84,6 +89,18 @@ TCP_CONNECT_TIMEOUT = CONFIG["TCP_CONNECT_TIMEOUT"]
 TCP_ECHO_TIMEOUT = CONFIG["TCP_ECHO_TIMEOUT"]
 DASHBOARD_PORT = CONFIG["DASHBOARD_PORT"]
 MAX_HISTORY = CONFIG["MAX_HISTORY"]
+SSL_VERIFY = CONFIG["SSL_VERIFY"]
+
+
+def _http_connector() -> TCPConnector:
+    """aiohttp outbound HTTPS; use unverified context when SSL_VERIFY is false (lab / OpenShift routes)."""
+    if SSL_VERIFY:
+        return TCPConnector()
+    ctx = ssl_module.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl_module.CERT_NONE
+    return TCPConnector(ssl=ctx)
+
 
 now_iso = lambda: datetime.now(timezone.utc).isoformat()
 
@@ -97,7 +114,7 @@ STATE = {
 HISTORY_IGNORE_BEFORE = None  # ISO string or None
 
 # ---------- Helpers ----------
-def set_state(section: str, name: str, status: str, error: Exception | str = ""):
+def set_state(section: str, name: str, status: str, error: Union[Exception, str] = ""):
     STATE[section][name] = {"status": status, "error": "" if not error else str(error), "last_update": now_iso()}
     if status == "error":
         logging.warning(f"[{section.upper()}] {name} -> error: {error}")
@@ -135,7 +152,8 @@ async def http_client_task(name: str, base_url: str, ping_path="/ping"):
     url, label = f"{base_url}{ping_path}", f"{name} (HTTP)"
     conn = {"status": "unknown", "since": now_iso()}
     timeout = aiohttp.ClientTimeout(total=HTTP_TIMEOUT)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
+    connector = _http_connector()
+    async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
         while True:
             try:
                 async with session.get(url) as resp:
@@ -228,7 +246,8 @@ async def poll_peer_status_task(name: str, base_url: str):
     """Legacy: poll by name and base_url (for ROUTE_PEERS)."""
     status_url, history_url = f"{base_url.rstrip('/')}/status", f"{base_url.rstrip('/')}/history"
     timeout = aiohttp.ClientTimeout(total=HTTP_TIMEOUT)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
+    connector = _http_connector()
+    async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
         while True:
             try:
                 async with session.get(status_url) as resp:
@@ -249,7 +268,8 @@ async def poll_node_status_task(url: str):
     status_url = f"{url.rstrip('/')}/status"
     history_url = f"{url.rstrip('/')}/history"
     timeout = aiohttp.ClientTimeout(total=HTTP_TIMEOUT)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
+    connector = _http_connector()
+    async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
         while True:
             key = url
             try:
@@ -288,6 +308,8 @@ td:first-child{text-align:left;font-weight:bold;background:#f9f9f9}
 .status-ok{background:#e6ffed;color:#1e7e34;font-weight:bold}
 .status-error{background:#ffebee;color:#d70000;font-weight:bold}
 .status-unknown{background:#fafafa;color:#777}
+.internal-diagonal{background:#fafafa;border:1px solid #e8e8e8}
+.mermaid-legend{font-size:13px;color:#555;margin-top:10px;line-height:1.5}
 pre{background:#fff;border:1px solid #ddd;padding:15px;border-radius:5px;white-space:pre-wrap;word-wrap:break-word;font-family:SFMono-Regular,Consolas,Menlo,monospace;font-size:13px;line-height:1.6}
 .history-item{border-bottom:1px solid #eee;padding:8px 2px;margin-bottom:5px}
 .history-item:last-child{border-bottom:none}
@@ -315,6 +337,7 @@ pre{background:#fff;border:1px solid #ddd;padding:15px;border-radius:5px;white-s
   <div class="section">
     <h2>Connectivity graph</h2>
     <div id="mermaid-container" class="mermaid"></div>
+    <p class="mermaid-legend"><b>Edges:</b> solid line (──) = TCP mesh OK in <i>both</i> directions between those two nodes. Dotted arrow (<code>-.-&gt;|down|</code>) = at least one direction is not <code>connected</code> in <code>/status</code>. (The graph does not hide broken edges; it restyles them.)</p>
   </div>
 
   <div class="section">
@@ -362,8 +385,8 @@ function renderInternalTcp(data){
     if(!d||d.error){nodeOrder.forEach(()=>{bodyRows+=cell('error','?');}); bodyRows+='</tr>'; return;}
     const conn=d.connections||{};
     nodeOrder.forEach(tgtNode=>{
-      if(tgtNode===srcNode){bodyRows+=`<td class="status-ok">self</td>`; return;}
-      const tgtIp=nodeToIp[tgtNode]; const s=tgtIp?get(conn,tgtIp+'.tcp','unknown'):'unknown';
+      if(tgtNode===srcNode){bodyRows+='<td class="internal-diagonal"></td>'; return;}
+      const tgtIp=nodeToIp[tgtNode]; const entry=tgtIp?(conn[tgtIp]||{}):null; const s=entry?(entry.tcp||'unknown'):'unknown';
       bodyRows+=cell(s,s);
     });
     bodyRows+='</tr>';
@@ -379,21 +402,26 @@ function renderMermaid(data){
   const id=(s)=>String(s).replace(/[^a-zA-Z0-9]/g,'_').replace(/^_/,'')||'n';
   let lines=['flowchart LR'];
   nodeOrder.forEach(n=>{lines.push('  '+id(n)+'["'+n+'"]');});
+  let edgeIdx=0; const downEdgeIdx=[];
   for(let i=0;i<nodeOrder.length;i++){
     for(let j=i+1;j<nodeOrder.length;j++){
       const src=nodeOrder[i], tgt=nodeOrder[j];
       const d=internal[src]; const conn=(d&&!d.error&&d.connections)||{};
-      const tgtIp=nodeToIp[tgt]; const s1=tgtIp?conn[tgtIp]?.tcp:'unknown';
+      const tgtIp=nodeToIp[tgt]; const s1=tgtIp?(conn[tgtIp]&&conn[tgtIp].tcp)||'unknown':'unknown';
       const d2=internal[tgt]; const conn2=(d2&&!d2.error&&d2.connections)||{};
-      const srcIp=nodeToIp[src]; const s2=srcIp?conn2[srcIp]?.tcp:'unknown';
+      const srcIp=nodeToIp[src]; const s2=srcIp?(conn2[srcIp]&&conn2[srcIp].tcp)||'unknown':'unknown';
       const ok=(s1==='connected'&&s2==='connected');
       const edge=ok ? ' --- ' : ' -.->|down| ';
       lines.push('  '+id(src)+edge+id(tgt));
+      if(!ok) downEdgeIdx.push(edgeIdx);
+      edgeIdx++;
     }
   }
-  container.textContent=lines.join('\\n');
-  container.setAttribute('data-processed','false');
-  if(window.mermaid){mermaid.run({nodes:[container], suppressErrors:true}).catch(()=>{});}
+  downEdgeIdx.forEach(i=>{lines.push('  linkStyle '+i+' stroke:#d70000,stroke-width:2px');});
+  const diagram=lines.join(String.fromCharCode(10));
+  container.innerHTML=''; container.textContent=diagram;
+  container.removeAttribute('data-processed');
+  if(window.mermaid){try{mermaid.run({nodes:[container], suppressErrors:true});}catch(e){}}
 }
 
 function renderHistory(hist){
@@ -483,7 +511,8 @@ async def _fanout_clear_to_peers():
     """POST /admin/clear_history to every node endpoint (NODE_STATUS_ENDPOINTS)."""
     urls = NODE_STATUS_ENDPOINTS if NODE_STATUS_ENDPOINTS else ROUTE_PEERS
     timeout = aiohttp.ClientTimeout(total=2.0)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
+    connector = _http_connector()
+    async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
         for url in urls:
             try:
                 async with session.post(f"{url.rstrip('/')}/admin/clear_history") as resp:

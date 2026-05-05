@@ -1,0 +1,23 @@
+# Applied once per node by deploy.sh (sed replaces REPLACE_*). Requires MetalLB or cloud LoadBalancer.
+# Set APPLY_LOADBALANCER=yes in deploy.conf. Pods must have label node-name=<node hostname>.
+apiVersion: v1
+kind: Service
+metadata:
+  name: REPLACE_NAME
+  namespace: REPLACE_NS
+spec:
+  type: LoadBalancer
+  externalTrafficPolicy: Local
+  selector:
+    app: migration-peer
+    node-name: REPLACE_NODE
+  ports:
+    - name: ws
+      port: 8080
+      targetPort: 8080
+    - name: tcp
+      port: 8081
+      targetPort: 8081
+    - name: http
+      port: 8082
+      targetPort: 8082

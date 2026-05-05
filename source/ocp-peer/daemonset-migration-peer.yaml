@@ -40,6 +40,8 @@ spec:
             - name: PEER_SERVICE
               value: "migration-peer-svc"
           ports:
+            - containerPort: 8080
+              name: ws
             - containerPort: 8081
               name: tcp
             - containerPort: 8082

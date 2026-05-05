@@ -76,7 +76,7 @@ podman tag your-registry.example.com:5000/applications/peer-app:v1.0.0 \
 
 ## Step 5: Deploy to Cluster (Script)
 
-The deploy script applies the DaemonSet, headless Service, NodePort Service (with image/namespace substitution), waits for pods, then runs **router sync**: labels pods with `node-name`, creates one Service and one Route per node, and prints **NODE_STATUS_ENDPOINTS** and **ROUTE_STATUS_ENDPOINTS**.
+The deploy script applies the DaemonSet, headless Service, NodePort Service exposing **8080 (WebSocket), 8081 (TCP), 8082 (HTTP)** (with image/namespace substitution), waits for pods, then runs **router sync**: labels pods with `node-name`, creates one Service and one Route per node, and prints **NODE_STATUS_ENDPOINTS**, **NODEPORT_PEERS** (for the external NodePort matrix), **ROUTE_STATUS_ENDPOINTS**, and optionally **METALLB_PEERS** when `APPLY_LOADBALANCER=yes` and LoadBalancers have external IPs.
 
 ### Config file
 
@@ -124,18 +124,30 @@ python bastion-client.py
 
 ### Option B: Run in Container
 
+Podman’s `--env-file` format is **`KEY=value` only**. Lines like `export KEY=value` are wrong: Podman sets a variable literally named `export KEY`, so `bastion-client.py` never reads `KEY` and falls back to built-in MetalLB/NodePort defaults while `NODE_STATUS_ENDPOINTS` stays empty.
+
+Use the Podman-oriented example (no `export` prefix):
+
 ```bash
+cp source/bastion-peer/config.podman.example.env source/bastion-peer/config.podman.env
+# Edit config.podman.env with deploy script output, then:
+
 # Build bastion client image (if not already built)
 cd source/bastion-peer
 podman build -t local-registry.example.com:5000/applications/bastion-client:latest -f Containerfile .
 
-# Run container
+# Run container (--network host: same DNS as the bastion so *.apps.* routes resolve; optional if you use --dns)
 podman run -d \
   --name migration-dashboard \
-  -p 9091:9091 \
-  --env-file config.env \
+  --network host \
+  --env-file config.podman.env \
   local-registry.example.com:5000/applications/bastion-client:latest
 ```
+
+Alternatively, strip `export ` from a shell-style file before passing it to Podman:  
+`grep -v '^#' config.env | sed 's/^export //' > config.podman.env`
+
+`deploy.sh` prints **`ROUTE_STATUS_ENDPOINTS`** with **`http://`** by default (`ROUTE_STATUS_SCHEME` in `deploy.conf`), because many labs return **503 on :443** from the bastion while **:80** serves `/ping` fine. Use `ROUTE_STATUS_SCHEME=https` when TLS from the bastion works end-to-end.
 
 ### Option C: Run with Environment Variables
 
