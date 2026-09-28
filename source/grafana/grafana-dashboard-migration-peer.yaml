@@ -1,0 +1,305 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-dashboard-migration-peer-mesh
+  namespace: grafana
+  labels:
+    app: migration-peer
+data:
+  dashboard.json: |
+    {
+      "annotations": { "list": [] },
+      "editable": true,
+      "fiscalYearStartMonth": 0,
+      "graphTooltip": 1,
+      "id": null,
+      "links": [],
+      "panels": [
+        {
+          "type": "nodeGraph",
+          "title": "TCP mesh (Node graph)",
+          "id": 1,
+          "gridPos": { "h": 16, "w": 24, "x": 0, "y": 0 },
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "targets": [
+            {
+              "refId": "edges",
+              "datasource": { "type": "prometheus", "uid": "${datasource}" },
+              "expr": "max by (id, source, target, mainstat, secondarystat) (migration_peer_edge)",
+              "format": "table",
+              "instant": true,
+              "legendFormat": "__auto"
+            }
+          ],
+          "transformations": [
+            {
+              "id": "labelsToFields",
+              "options": { "mode": "columns" }
+            },
+            {
+              "id": "organize",
+              "options": {
+                "excludeByName": {
+                  "Time": true,
+                  "Value": true,
+                  "__name__": true,
+                  "container": true,
+                  "endpoint": true,
+                  "instance": true,
+                  "job": true,
+                  "namespace": true,
+                  "pod": true,
+                  "service": true,
+                  "prometheus": true
+                },
+                "renameByName": {
+                  "id": "id",
+                  "source": "source",
+                  "target": "target",
+                  "mainstat": "mainstat",
+                  "secondarystat": "secondarystat"
+                }
+              }
+            },
+            {
+              "id": "convertFieldType",
+              "options": {
+                "conversions": [
+                  { "targetField": "mainstat", "destinationType": "number" },
+                  { "targetField": "secondarystat", "destinationType": "number" }
+                ],
+                "fields": {}
+              }
+            }
+          ],
+          "options": {
+            "nodes": { "mainStatUnit": "none" },
+            "edges": { "mainStatUnit": "none" }
+          },
+          "fieldConfig": {
+            "defaults": {},
+            "overrides": [
+              {
+                "matcher": { "id": "byName", "options": "mainstat" },
+                "properties": [
+                  { "id": "displayName", "value": "up (1/0)" },
+                  {
+                    "id": "thresholds",
+                    "value": {
+                      "mode": "absolute",
+                      "steps": [
+                        { "color": "red", "value": null },
+                        { "color": "green", "value": 1 }
+                      ]
+                    }
+                  },
+                  { "id": "color", "value": { "mode": "thresholds" } }
+                ]
+              },
+              {
+                "matcher": { "id": "byName", "options": "secondarystat" },
+                "properties": [
+                  { "id": "displayName", "value": "disconnects" }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "type": "table",
+          "title": "Mesh edges (up + disconnect totals)",
+          "id": 2,
+          "gridPos": { "h": 10, "w": 12, "x": 0, "y": 16 },
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "migration_peer_tcp_up",
+              "format": "table",
+              "instant": true
+            },
+            {
+              "refId": "B",
+              "expr": "migration_peer_tcp_disconnects_total",
+              "format": "table",
+              "instant": true
+            }
+          ],
+          "transformations": [
+            { "id": "seriesToRows", "options": {} },
+            {
+              "id": "organize",
+              "options": {
+                "excludeByName": {
+                  "Time": true,
+                  "__name__": true,
+                  "container": true,
+                  "endpoint": true,
+                  "instance": true,
+                  "job": true,
+                  "namespace": true,
+                  "pod": true,
+                  "service": true,
+                  "prometheus": true
+                },
+                "renameByName": {
+                  "src_node": "source",
+                  "dst_node": "target",
+                  "Value": "value"
+                }
+              }
+            }
+          ]
+        },
+        {
+          "type": "timeseries",
+          "title": "Disconnect rate (flaps / min)",
+          "id": 3,
+          "gridPos": { "h": 10, "w": 12, "x": 12, "y": 16 },
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (src_node, dst_node) (rate(migration_peer_tcp_disconnects_total[5m])) * 60",
+              "legendFormat": "{{src_node}} → {{dst_node}}",
+              "range": true
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "mpm",
+              "custom": {
+                "drawStyle": "line",
+                "lineInterpolation": "smooth",
+                "fillOpacity": 10,
+                "showPoints": "auto"
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["sum", "max"] },
+            "tooltip": { "mode": "multi", "sort": "desc" }
+          }
+        },
+        {
+          "type": "stat",
+          "title": "Peers reporting",
+          "id": 4,
+          "gridPos": { "h": 4, "w": 6, "x": 0, "y": 26 },
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "targets": [
+            { "refId": "A", "expr": "count(migration_peer_info)", "instant": true }
+          ],
+          "options": {
+            "reduceOptions": { "calcs": ["lastNotNull"] },
+            "colorMode": "value",
+            "graphMode": "none"
+          }
+        },
+        {
+          "type": "stat",
+          "title": "Edges up",
+          "id": 5,
+          "gridPos": { "h": 4, "w": 6, "x": 6, "y": 26 },
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "targets": [
+            { "refId": "A", "expr": "count(migration_peer_tcp_up == 1)", "instant": true }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  { "color": "red", "value": null },
+                  { "color": "green", "value": 1 }
+                ]
+              }
+            }
+          },
+          "options": {
+            "reduceOptions": { "calcs": ["lastNotNull"] },
+            "colorMode": "value",
+            "graphMode": "none"
+          }
+        },
+        {
+          "type": "stat",
+          "title": "Edges down",
+          "id": 6,
+          "gridPos": { "h": 4, "w": 6, "x": 12, "y": 26 },
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "targets": [
+            { "refId": "A", "expr": "count(migration_peer_tcp_up == 0) OR on() vector(0)", "instant": true }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  { "color": "green", "value": null },
+                  { "color": "red", "value": 1 }
+                ]
+              }
+            }
+          },
+          "options": {
+            "reduceOptions": { "calcs": ["lastNotNull"] },
+            "colorMode": "value",
+            "graphMode": "none"
+          }
+        },
+        {
+          "type": "stat",
+          "title": "Total disconnects (all edges)",
+          "id": 7,
+          "gridPos": { "h": 4, "w": 6, "x": 18, "y": 26 },
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "targets": [
+            { "refId": "A", "expr": "sum(migration_peer_tcp_disconnects_total)", "instant": true }
+          ],
+          "options": {
+            "reduceOptions": { "calcs": ["lastNotNull"] },
+            "colorMode": "value",
+            "graphMode": "area"
+          }
+        }
+      ],
+      "refresh": "10s",
+      "schemaVersion": 39,
+      "tags": ["migration", "ovn", "mesh"],
+      "templating": {
+        "list": [
+          {
+            "name": "datasource",
+            "type": "datasource",
+            "query": "prometheus",
+            "current": {},
+            "hide": 0,
+            "includeAll": false,
+            "multi": false
+          }
+        ]
+      },
+      "time": { "from": "now-1h", "to": "now" },
+      "timepicker": {},
+      "timezone": "browser",
+      "title": "Migration peer TCP mesh",
+      "uid": "migration-peer-mesh",
+      "version": 1
+    }
+---
+apiVersion: grafana.integreatly.org/v1beta1
+kind: GrafanaDashboard
+metadata:
+  name: migration-peer-mesh
+  namespace: grafana
+spec:
+  instanceSelector:
+    matchLabels:
+      dashboards: grafana
+  allowCrossNamespaceImport: false
+  resyncPeriod: 60s
+  configMapRef:
+    name: grafana-dashboard-migration-peer-mesh
+    key: dashboard.json

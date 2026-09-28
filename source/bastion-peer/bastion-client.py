@@ -44,9 +44,8 @@ def load_config():
     node_endpoints = os.getenv("NODE_STATUS_ENDPOINTS", "")
     config["NODE_STATUS_ENDPOINTS"] = [url.strip() for url in node_endpoints.split(",") if url.strip()]
 
-    # Per-node route endpoints (optional) - for router connectivity test, one URL per node
-    route_endpoints = os.getenv("ROUTE_STATUS_ENDPOINTS", "")
-    config["ROUTE_STATUS_ENDPOINTS"] = [url.strip() for url in route_endpoints.split(",") if url.strip()]
+    # Shared OpenShift Route (bastion → router → Service); from deploy.sh when APPLY_ROUTE_PROBE=yes
+    config["ROUTE_PROBE_URL"] = os.getenv("ROUTE_PROBE_URL", "").strip()
 
     # Intervals (in seconds)
     config["HTTP_INTERVAL"] = float(os.getenv("HTTP_INTERVAL", "1.0"))
@@ -76,7 +75,7 @@ METALLB_PEERS = CONFIG["METALLB_PEERS"]
 NODEPORT_PEERS = CONFIG["NODEPORT_PEERS"]
 ROUTE_PEERS = CONFIG["ROUTE_PEERS"]
 NODE_STATUS_ENDPOINTS = CONFIG["NODE_STATUS_ENDPOINTS"]
-ROUTE_STATUS_ENDPOINTS = CONFIG["ROUTE_STATUS_ENDPOINTS"]
+ROUTE_PROBE_URL = CONFIG["ROUTE_PROBE_URL"]
 HTTP_INTERVAL = CONFIG["HTTP_INTERVAL"]
 WS_INTERVAL = CONFIG["WS_INTERVAL"]
 TCP_INTERVAL = CONFIG["TCP_INTERVAL"]
@@ -112,6 +111,12 @@ STATE = {
 
 # cutoff to ignore peer events older than the last "clear"
 HISTORY_IGNORE_BEFORE = None  # ISO string or None
+# NODE_STATUS_ENDPOINTS url -> node_name (so poll failures update the right row, not a stale duplicate)
+URL_NODE_KEYS: dict[str, str] = {}
+# node_name -> pod IPs seen this session (keeps mesh history after a pod IP changes)
+NODE_IP_HISTORY: dict[str, set[str]] = {}
+# Drop pod→IP events only when older than this and IP is not a known IP for that node
+STALE_MESH_MAX_AGE_SEC = float(os.getenv("STALE_MESH_MAX_AGE_SEC", "900"))
 
 # ---------- Helpers ----------
 def set_state(section: str, name: str, status: str, error: Union[Exception, str] = ""):
@@ -119,17 +124,159 @@ def set_state(section: str, name: str, status: str, error: Union[Exception, str]
     if status == "error":
         logging.warning(f"[{section.upper()}] {name} -> error: {error}")
 
+def _probe_target_node(probe_name: str) -> str:
+    """Map peer-N-np / ingress-N probe name to OpenShift node name (NODE_STATUS_ENDPOINTS order)."""
+    parts = (probe_name or "").split("-")
+    if len(parts) >= 3 and parts[0] == "peer" and parts[-1] == "np":
+        try:
+            idx = int(parts[1]) - 1
+            if 0 <= idx < len(NODE_STATUS_ENDPOINTS):
+                return URL_NODE_KEYS.get(NODE_STATUS_ENDPOINTS[idx], "") or ""
+        except ValueError:
+            pass
+    return ""
+
+
+def _build_pod_to_node() -> dict:
+    pod_to_node = {}
+    for _key, data in STATE["internal_status"].items():
+        if _key.startswith("http://") or _key.startswith("https://"):
+            continue
+        if not isinstance(data, dict) or "error" in data:
+            continue
+        self_info = data.get("self") or {}
+        pod = self_info.get("pod_name")
+        node = self_info.get("node_name") or _key
+        if pod and node:
+            pod_to_node[pod] = node
+    return pod_to_node
+
+
+def _note_node_pod_ip(node: str, ip: str) -> None:
+    if node and ip:
+        NODE_IP_HISTORY.setdefault(node, set()).add(ip)
+
+
+def _ip_to_node_map() -> dict:
+    """Current + previously seen pod IPs per node (for mesh history labels and stale filter)."""
+    m: dict[str, str] = {}
+    for node, ips in NODE_IP_HISTORY.items():
+        for ip in ips:
+            m[ip] = node
+    _, live = _build_node_order_and_ip_map()
+    m.update(live)
+    return m
+
+
+def _current_peer_ips() -> set:
+    ips = set()
+    for _key, data in STATE["internal_status"].items():
+        if _key.startswith("http://") or _key.startswith("https://"):
+            continue
+        if not isinstance(data, dict):
+            continue
+        pod_ip = (data.get("self") or {}).get("pod_ip")
+        if pod_ip:
+            ips.add(pod_ip)
+    return ips
+
+
+def _is_stale_history_event(ev: dict, current_ips: set) -> bool:
+    """Drop ancient pod→IP events; keep recent mesh outages and IPs seen on a known node."""
+    if ev.get("source") != "pod":
+        return False
+    target_ip = ev.get("name") or ""
+    if not target_ip or "." not in target_ip:
+        return False
+    if target_ip in current_ips:
+        return False
+    target_node = ev.get("target_node")
+    if target_node and target_ip in NODE_IP_HISTORY.get(target_node, set()):
+        return False
+    try:
+        end = datetime.fromisoformat(ev.get("end_time", ""))
+        if (datetime.now(timezone.utc) - end).total_seconds() < STALE_MESH_MAX_AGE_SEC:
+            return False
+    except Exception:
+        return False
+    return True
+
+
+def _history_label(ev: dict, ip_to_node: dict, pod_to_node: dict) -> str:
+    src = ev.get("source") or ""
+    proto = ev.get("protocol") or "?"
+    if src == "bastion":
+        if ev.get("name") == "route-probe":
+            return f"Bastion → OpenShift Route ({proto})"
+        node = ev.get("target_node") or _probe_target_node(ev.get("name", ""))
+        return f"Bastion → {node or ev.get('name', '?')} ({proto})"
+    if src == "pod":
+        reporter = ev.get("reporter_node") or pod_to_node.get(ev.get("reporter"), ev.get("reporter", "?"))
+        target_ip = ev.get("name", "")
+        target = ev.get("target_node") or ip_to_node.get(target_ip, target_ip)
+        if target != target_ip:
+            return f"Mesh {reporter} → {target} ({proto})"
+        return f"Mesh {reporter} → {target_ip} ({proto})"
+    return ev.get("name", "?")
+
+
+def _fmt_time_range(ev: dict) -> str:
+    s = (ev.get("start_time") or "")[:19].replace("T", " ")
+    e = (ev.get("end_time") or "")[:19].replace("T", " ")
+    return f"{s} – {e} UTC"
+
+
+def _prune_stale_history() -> None:
+    current_ips = _current_peer_ips()
+    if not current_ips:
+        return
+    STATE["history"] = [
+        ev for ev in STATE["history"]
+        if _is_after_cutoff(ev) and not _is_stale_history_event(ev, current_ips)
+    ]
+
+
+def _history_for_api(ip_to_node: dict) -> list:
+    _prune_stale_history()
+    ip_map = _ip_to_node_map()
+    pod_to_node = _build_pod_to_node()
+    enriched = []
+    for ev in STATE["history"]:
+        if not _is_after_cutoff(ev):
+            continue
+        row = dict(ev)
+        if row.get("source") == "pod":
+            row["target_node"] = row.get("target_node") or ip_map.get(row.get("name", ""), "")
+            row["reporter_node"] = row.get("reporter_node") or pod_to_node.get(
+                row.get("reporter", ""), row.get("reporter", "")
+            )
+        elif row.get("source") == "bastion" and not row.get("target_node"):
+            row["target_node"] = _probe_target_node(row.get("name", ""))
+        row["label"] = _history_label(row, ip_map, pod_to_node)
+        row["time_range"] = _fmt_time_range(row)
+        enriched.append(row)
+    enriched.sort(key=lambda h: h.get("end_time") or "", reverse=True)
+    return enriched
+
+
 def log_disconnection_event(name: str, proto: str, start_time_str: str, *, source: str = "bastion"):
     try:
         start = datetime.fromisoformat(start_time_str)
         end = datetime.now(timezone.utc)
         dur = (end - start).total_seconds()
-        STATE["history"].insert(0, {
-            "name": name, "protocol": proto,
-            "start_time": start.isoformat(), "end_time": end.isoformat(),
-            "duration_sec": round(dur, 2), "source": source
-        })
+        entry = {
+            "name": name,
+            "protocol": proto,
+            "start_time": start.isoformat(),
+            "end_time": end.isoformat(),
+            "duration_sec": round(dur, 2),
+            "source": source,
+        }
+        if source == "bastion":
+            entry["target_node"] = _probe_target_node(name)
+        STATE["history"].insert(0, entry)
         del STATE["history"][MAX_HISTORY:]
+        _prune_stale_history()
         logging.info(f"--- OUTAGE ENDED: {name} ({proto}, {source}) {dur:.2f}s ---")
     except Exception as e:
         logging.error(f"History error: {e}")
@@ -148,7 +295,7 @@ def _is_after_cutoff(ev: dict) -> bool:
         return True
 
 # ---------- Probes ----------
-async def http_client_task(name: str, base_url: str, ping_path="/ping"):
+async def http_client_task(name: str, base_url: str, ping_path="/ping", *, log_history: bool = True):
     url, label = f"{base_url}{ping_path}", f"{name} (HTTP)"
     conn = {"status": "unknown", "since": now_iso()}
     timeout = aiohttp.ClientTimeout(total=HTTP_TIMEOUT)
@@ -158,7 +305,7 @@ async def http_client_task(name: str, base_url: str, ping_path="/ping"):
             try:
                 async with session.get(url) as resp:
                     resp.raise_for_status()
-                    if conn["status"] == "error":
+                    if log_history and conn["status"] == "error":
                         log_disconnection_event(name, "HTTP", conn["since"], source="bastion")
                     conn["status"] = "connected"; conn["since"] = now_iso()
                     set_state("external_tests", label, "connected")
@@ -223,9 +370,16 @@ async def tcp_client_task(name: str, host: str, port: int):
 
 def _merge_peer_history(peer_hist: list) -> None:
     """Merge peer history into STATE['history'], dedupe, sort, cap."""
+    ip_map = _ip_to_node_map()
     filtered = []
     for ev in peer_hist:
+        ev = dict(ev)
         ev.setdefault("source", "pod")
+        target_ip = ev.get("name") or ""
+        if target_ip:
+            ev["target_node"] = ip_map.get(target_ip, ev.get("target_node", ""))
+            if ev["target_node"]:
+                _note_node_pod_ip(ev["target_node"], target_ip)
         if _is_after_cutoff(ev):
             filtered.append(ev)
     if not filtered:
@@ -241,6 +395,7 @@ def _merge_peer_history(peer_hist: list) -> None:
         STATE["history"][0:0] = new_items
         STATE["history"].sort(key=lambda h: h.get("end_time") or "", reverse=True)
         del STATE["history"][MAX_HISTORY:]
+        _prune_stale_history()
 
 async def poll_peer_status_task(name: str, base_url: str):
     """Legacy: poll by name and base_url (for ROUTE_PEERS)."""
@@ -271,16 +426,31 @@ async def poll_node_status_task(url: str):
     connector = _http_connector()
     async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
         while True:
-            key = url
             try:
                 async with session.get(status_url) as resp:
                     resp.raise_for_status()
                     data = await resp.json()
                     self_info = data.get("self") or {}
                     key = self_info.get("node_name") or self_info.get("pod_name") or url
+                    URL_NODE_KEYS[url] = key
                     STATE["internal_status"][key] = data
+                    if self_info.get("pod_ip"):
+                        _note_node_pod_ip(key, self_info["pod_ip"])
+                    if url != key:
+                        STATE["internal_status"].pop(url, None)
+                    _prune_stale_history()
             except Exception as e:
-                STATE["internal_status"][key] = {"error": str(e), "url": status_url}
+                key = URL_NODE_KEYS.get(url, url)
+                prev = STATE["internal_status"].get(key)
+                prev_self = prev.get("self") if isinstance(prev, dict) and "error" not in prev else None
+                STATE["internal_status"][key] = {
+                    "error": str(e),
+                    "url": status_url,
+                    "last_update": now_iso(),
+                    "self": prev_self,
+                }
+                if url != key:
+                    STATE["internal_status"].pop(url, None)
             try:
                 async with session.get(history_url) as resp:
                     resp.raise_for_status()
@@ -318,7 +488,7 @@ pre{background:#fff;border:1px solid #ddd;padding:15px;border-radius:5px;white-s
 .btn:hover{background:#f0f0f0}
 .btn:disabled{opacity:.6;cursor:not-allowed}
 .header-row{display:flex;align-items:center;justify-content:space-between}
-#mermaid-container{min-height:120px;font-size:14px}
+#mermaid-container{min-height:160px;font-size:13px;overflow:auto}
 </style>
 <script src="https://cdn.jsdelivr.net/npm/mermaid/dist/mermaid.min.js"></script>
 </head>
@@ -331,13 +501,14 @@ pre{background:#fff;border:1px solid #ddd;padding:15px;border-radius:5px;white-s
     <h2>External Tests (Bastion → Cluster)</h2>
     <table id="metallb-matrix"><thead><tr><th>Target (LoadBalancer)</th><th>HTTP</th><th>WebSocket (WS)</th><th>Raw TCP</th></tr></thead><tbody id="metallb-matrix-body"></tbody></table><br/>
     <table id="external-matrix"><thead><tr><th>Target (NodePort)</th><th>HTTP</th><th>WebSocket (WS)</th><th>Raw TCP</th></tr></thead><tbody id="external-matrix-body"></tbody></table><br/>
-    <table id="route-matrix"><thead><tr><th>Target (Route)</th><th>HTTP /ping</th></tr></thead><tbody id="route-matrix-body"></tbody></table>
+    <table id="route-probe-matrix"><thead><tr><th>Target (OpenShift Route)</th><th>HTTP /ping</th><th>Host</th></tr></thead><tbody id="route-probe-matrix-body"></tbody></table>
   </div>
 
   <div class="section">
     <h2>Connectivity graph</h2>
     <div id="mermaid-container" class="mermaid"></div>
-    <p class="mermaid-legend"><b>Edges:</b> solid line (──) = TCP mesh OK in <i>both</i> directions between those two nodes. Dotted arrow (<code>-.-&gt;|down|</code>) = at least one direction is not <code>connected</code> in <code>/status</code>. (The graph does not hide broken edges; it restyles them.)</p>
+    <p class="mermaid-legend"><b>Bastion → node:</b> solid = NodePort <code>/ping</code> on that node&rsquo;s host IP (same order as <code>node_order</code>). Dotted = ingress check failing. <b>Route table:</b> one shared OpenShift Route to the NodePort service (tests the cluster router).<br/>
+    <b>Between nodes:</b> two arrows per pair (one per direction). A rebooting node stays on the graph; red/dotted = down or unreachable (stale outbound is not shown as green). Solid green = <code>connected</code>.</p>
   </div>
 
   <div class="section">
@@ -357,11 +528,11 @@ pre{background:#fff;border:1px solid #ddd;padding:15px;border-radius:5px;white-s
 <script>
 const get=(o,p,d=null)=>{try{return p.split('.').reduce((a,k)=>(a&&a[k]!==undefined)?a[k]:undefined,o)??d}catch(_){return d}};
 function cell(s,t){let c='status-unknown';if(s==='connected')c='status-ok';else if(s==='error')c='status-error';return `<td class="${c}">${t}</td>`;}
+function bases(ext, needle){const b=new Set();Object.keys(ext||{}).forEach(k=>{if(k.includes(needle))b.add(k.replace(' (HTTP)','').replace(' (WS)','').replace(' (TCP)',''));});return [...b].sort();}
 
-function renderMetalLBMatrix(ext){const tb=document.getElementById('metallb-matrix-body');if(!tb)return;const keys=Object.keys(ext||{}).filter(k=>k.includes('lb'));let h='';keys.forEach(k=>{const base=k.replace(' (HTTP)','').replace(' (WS)','').replace(' (TCP)','');const httpS=get(ext,base+' (HTTP).status','unknown');const wsS=get(ext,base+' (WS).status','unknown');const tcpS=get(ext,base+' (TCP).status','unknown');h+='<tr>';h+=`<td><b>${base}</b></td>`;h+=cell(httpS,httpS)+cell(wsS,wsS)+cell(tcpS,tcpS);h+='</tr>';});tb.innerHTML=h||'<tr><td>No data</td></tr>';}
-function renderExternalMatrix(ext){const tb=document.getElementById('external-matrix-body');if(!tb)return;const keys=Object.keys(ext||{}).filter(k=>k.includes('np'));let h='';keys.forEach(k=>{const base=k.replace(' (HTTP)','').replace(' (WS)','').replace(' (TCP)','');const httpS=get(ext,base+' (HTTP).status','unknown');const wsS=get(ext,base+' (WS).status','unknown');const tcpS=get(ext,base+' (TCP).status','unknown');h+='<tr>';h+=`<td><b>${base}</b></td>`;h+=cell(httpS,httpS)+cell(wsS,wsS)+cell(tcpS,tcpS);h+='</tr>';});tb.innerHTML=h||'<tr><td>No data</td></tr>';}
-function renderRouteMatrix(ext){const tb=document.getElementById('route-matrix-body');if(!tb)return;const keys=Object.keys(ext||{}).filter(k=>k.endsWith(' (HTTP)')||k.includes('Router'));let h='';keys.forEach(k=>{const name=k.replace(' (HTTP)','');const pingS=get(ext,k+'.status','unknown');h+='<tr>';h+=`<td><b>${name}</b></td>`;h+=cell(pingS,pingS);h+='</tr>';});tb.innerHTML=h||'<tr><td>No data</td></tr>';}
-
+function renderMetalLBMatrix(ext){const tb=document.getElementById('metallb-matrix-body');if(!tb)return;const rows=bases(ext,'-lb');let h='';rows.forEach(base=>{const httpS=get(ext,base+' (HTTP).status','unknown');const wsS=get(ext,base+' (WS).status','unknown');const tcpS=get(ext,base+' (TCP).status','unknown');h+='<tr>';h+=`<td><b>${base}</b></td>`;h+=cell(httpS,httpS)+cell(wsS,wsS)+cell(tcpS,tcpS);h+='</tr>';});tb.innerHTML=h||'<tr><td>No data</td></tr>';}
+function renderExternalMatrix(ext){const tb=document.getElementById('external-matrix-body');if(!tb)return;const rows=bases(ext,'-np');let h='';rows.forEach(base=>{const httpS=get(ext,base+' (HTTP).status','unknown');const wsS=get(ext,base+' (WS).status','unknown');const tcpS=get(ext,base+' (TCP).status','unknown');h+='<tr>';h+=`<td><b>${base}</b></td>`;h+=cell(httpS,httpS)+cell(wsS,wsS)+cell(tcpS,tcpS);h+='</tr>';});tb.innerHTML=h||'<tr><td>No data</td></tr>';}
+function renderRouteProbe(ext,routeProbe){const tb=document.getElementById('route-probe-matrix-body');if(!tb)return;if(!routeProbe){tb.innerHTML='<tr><td colspan="3"><i>Set ROUTE_PROBE_URL (deploy with APPLY_ROUTE_PROBE=yes)</i></td></tr>';return;}const k='route-probe (HTTP)';const pingS=get(ext,k+'.status','unknown');const host=routeProbe.replace(/^https?:\\/\\//,'').replace(/\\/+$/,'');tb.innerHTML='<tr><td><b>Shared route</b></td>'+cell(pingS,pingS)+`<td style="text-align:left;font-weight:normal">${host}</td></tr>`;}
 function buildNodeToIp(internal, ipToNode){
   const nodeToIp={};
   for(const key of Object.keys(internal||{})){
@@ -374,18 +545,21 @@ function buildNodeToIp(internal, ipToNode){
 
 function renderInternalTcp(data){
   const internal=data.internal_status||{}; const nodeOrder=data.node_order||[]; const ipToNode=data.ip_to_node||{};
+  const ingressReach=(data.mgraph||{}).ingress_nodeport||[];
   const thead=document.getElementById('internal-tcp-head'); const tbody=document.getElementById('internal-tcp-body');
   if(!thead||!tbody)return;
   const nodeToIp=buildNodeToIp(internal, ipToNode);
   if(nodeOrder.length===0){thead.innerHTML='<tr><th>Source</th></tr>';tbody.innerHTML='<tr><td>No nodes (set NODE_STATUS_ENDPOINTS)</td></tr>';return;}
   let headCells='<th>Source</th>'; nodeOrder.forEach(n=>{headCells+=`<th>→ ${n}</th>`;}); thead.innerHTML='<tr>'+headCells+'</tr>';
   let bodyRows='';
-  nodeOrder.forEach(srcNode=>{
-    const d=internal[srcNode]; bodyRows+=`<tr><td><b>${srcNode}</b></td>`;
-    if(!d||d.error){nodeOrder.forEach(()=>{bodyRows+=cell('error','?');}); bodyRows+='</tr>'; return;}
+  nodeOrder.forEach((srcNode,si)=>{
+    const d=internal[srcNode]; const srcUp=ingressReach[si]==='connected';
+    bodyRows+=`<tr><td><b>${srcNode}</b></td>`;
+    if(!d||d.error||!srcUp){nodeOrder.forEach((tgtNode,tj)=>{if(tgtNode===srcNode)bodyRows+='<td class="internal-diagonal"></td>';else bodyRows+=cell('error',d&&d.error?'err':'down');}); bodyRows+='</tr>'; return;}
     const conn=d.connections||{};
-    nodeOrder.forEach(tgtNode=>{
+    nodeOrder.forEach((tgtNode,tj)=>{
       if(tgtNode===srcNode){bodyRows+='<td class="internal-diagonal"></td>'; return;}
+      if(ingressReach[tj]!=='connected'){bodyRows+=cell('error','down'); return;}
       const tgtIp=nodeToIp[tgtNode]; const entry=tgtIp?(conn[tgtIp]||{}):null; const s=entry?(entry.tcp||'unknown'):'unknown';
       bodyRows+=cell(s,s);
     });
@@ -396,28 +570,57 @@ function renderInternalTcp(data){
 
 function renderMermaid(data){
   const nodeOrder=data.node_order||[]; const internal=data.internal_status||{}; const ipToNode=data.ip_to_node||{};
+  const mgraph=data.mgraph||{};
+  const ingressRoute=mgraph.ingress_nodeport||[];
   const nodeToIp=buildNodeToIp(internal, ipToNode);
   const container=document.getElementById('mermaid-container'); if(!container)return;
   if(nodeOrder.length===0){container.textContent='No nodes'; container.removeAttribute('data-processed'); return;}
   const id=(s)=>String(s).replace(/[^a-zA-Z0-9]/g,'_').replace(/^_/,'')||'n';
-  let lines=['flowchart LR'];
-  nodeOrder.forEach(n=>{lines.push('  '+id(n)+'["'+n+'"]');});
-  let edgeIdx=0; const downEdgeIdx=[];
+  const esc=(s)=>String(s).replace(/"/g,'\\"').replace(/\\|/g,' ');
+  let lines=['flowchart TB'];
+  lines.push('  subgraph ingress["Ingress checks"]');
+  lines.push('    direction LR');
+  lines.push('    bastion((Bastion))');
+  lines.push('  end');
+  lines.push('  subgraph mesh["Cluster TCP mesh"]');
+  lines.push('    direction LR');
+  nodeOrder.forEach(n=>{lines.push('    '+id(n)+'["'+esc(n)+'"]');});
+  lines.push('  end');
+  lines.push('  classDef mBastion fill:#e3f2fd,stroke:#1565c0,stroke-width:2px');
+  lines.push('  classDef mWorker fill:#fafafa,stroke:#424242,stroke-width:1px');
+  lines.push('  class bastion mBastion');
+  if(nodeOrder.length) lines.push('  class '+nodeOrder.map(n=>id(n)).join(',')+' mWorker');
+  const linkOk=[];
+  const nodeIds=nodeOrder.map(n=>id(n));
+  for(let i=0;i<nodeIds.length-1;i++){lines.push('  '+nodeIds[i]+' ~~~ '+nodeIds[i+1]); linkOk.push(null);}
+  nodeOrder.forEach((n,i)=>{
+    const ok=(ingressRoute[i]==='connected');
+    const lab=ok?'ingress OK':'ingress fail';
+    if(ok) lines.push('  bastion-->|"'+lab+'"|'+id(n));
+    else lines.push('  bastion-.->|"'+lab+'"|'+id(n));
+    linkOk.push(ok);
+  });
   for(let i=0;i<nodeOrder.length;i++){
-    for(let j=i+1;j<nodeOrder.length;j++){
+    const srcUp=ingressRoute[i]==='connected';
+    for(let j=0;j<nodeOrder.length;j++){
+      if(i===j) continue;
+      const tgtUp=ingressRoute[j]==='connected';
       const src=nodeOrder[i], tgt=nodeOrder[j];
-      const d=internal[src]; const conn=(d&&!d.error&&d.connections)||{};
-      const tgtIp=nodeToIp[tgt]; const s1=tgtIp?(conn[tgtIp]&&conn[tgtIp].tcp)||'unknown':'unknown';
-      const d2=internal[tgt]; const conn2=(d2&&!d2.error&&d2.connections)||{};
-      const srcIp=nodeToIp[src]; const s2=srcIp?(conn2[srcIp]&&conn2[srcIp].tcp)||'unknown':'unknown';
-      const ok=(s1==='connected'&&s2==='connected');
-      const edge=ok ? ' --- ' : ' -.->|down| ';
-      lines.push('  '+id(src)+edge+id(tgt));
-      if(!ok) downEdgeIdx.push(edgeIdx);
-      edgeIdx++;
+      const d=internal[src]; const conn=(d&&!d.error&&srcUp&&d.connections)||{};
+      const tgtIp=nodeToIp[tgt];
+      const s=(srcUp&&tgtUp&&tgtIp)?(conn[tgtIp]&&conn[tgtIp].tcp)||'unknown':'unknown';
+      const ok=(s==='connected');
+      const lab='TCP '+(i+1)+'→'+(j+1)+(ok?'':' ×');
+      if(ok) lines.push('  '+id(src)+'-->|"'+esc(lab)+'"|'+id(tgt));
+      else lines.push('  '+id(src)+'-.->|"'+esc(lab)+'"|'+id(tgt));
+      linkOk.push(ok);
     }
   }
-  downEdgeIdx.forEach(i=>{lines.push('  linkStyle '+i+' stroke:#d70000,stroke-width:2px');});
+  linkOk.forEach((ok,idx)=>{
+    if(ok===null) return;
+    if(ok) lines.push('  linkStyle '+idx+' stroke:#1e7e34,stroke-width:2px');
+    else lines.push('  linkStyle '+idx+' stroke:#d70000,stroke-width:2px');
+  });
   const diagram=lines.join(String.fromCharCode(10));
   container.innerHTML=''; container.textContent=diagram;
   container.removeAttribute('data-processed');
@@ -428,14 +631,10 @@ function renderHistory(hist){
   const el=document.getElementById('history-log');
   if(!el)return; if(!hist||hist.length===0){el.textContent='No disconnections yet.';return;}
   let h=''; for(const ev of hist){
-    const src=ev.source||''; let label='';
-    if(src==='bastion'){label=`Bastion → ${ev.name||'unknown'}`;}
-    else if(src==='pod'&&ev.reporter){label=`${ev.reporter} → ${ev.name||'unknown'}`;}
-    else{label=`${ev.name||'unknown'}`;}
-    h+=`<div class="history-item"><b>[${ev.protocol}] ${label}</b>\\n`+
-       `  <span class="hist-down">DISCONNECTED</span> for <b>${ev.duration_sec}s</b>\\n`+
-       `  Started: ${ev.start_time}\\n`+
-       `  Ended:   ${ev.end_time}\\n`+
+    const label=ev.label||ev.name||'unknown';
+    const range=ev.time_range||'';
+    h+=`<div class="history-item"><b>${label}</b>\\n`+
+       `  <span class="hist-down">down</span> <b>${ev.duration_sec}s</b>${range?` &nbsp;(${range})`:''}\\n`+
        `</div>`;
   }
   el.innerHTML=h;
@@ -447,7 +646,7 @@ async function loop(){
     document.getElementById('timestamp').innerText='Last Updated: '+new Date().toISOString();
     renderMetalLBMatrix(data.external_tests);
     renderExternalMatrix(data.external_tests);
-    renderRouteMatrix(data.external_tests);
+    renderRouteProbe(data.external_tests, data.route_probe_url);
     renderInternalTcp(data);
     renderMermaid(data);
     renderHistory(data.history);
@@ -481,20 +680,54 @@ loop(); setInterval(loop,1000);
 
 # ---------- API helpers ----------
 def _build_node_order_and_ip_map():
-    """From internal_status build sorted node list and pod_ip -> node_name map."""
-    nodes_set = set()
+    """Stable node list aligned with NODE_STATUS_ENDPOINTS / ingress-{i} probes (includes nodes while down)."""
     ip_to_node = {}
+    node_order: list[str] = []
+    seen: set[str] = set()
+
+    # Primary order: same indices as ingress-0..n and deploy.sh output (sorted node names at deploy time)
+    for i, url in enumerate(NODE_STATUS_ENDPOINTS):
+        node = URL_NODE_KEYS.get(url)
+        if not node:
+            data = STATE["internal_status"].get(url)
+            if isinstance(data, dict) and data.get("self", {}).get("node_name"):
+                node = data["self"]["node_name"]
+        if not node:
+            node = f"node-{i + 1}"
+        if node in seen:
+            continue
+        node_order.append(node)
+        seen.add(node)
+
     for _key, data in STATE["internal_status"].items():
-        if not isinstance(data, dict) or "error" in data:
+        if _key.startswith("http://") or _key.startswith("https://"):
+            continue
+        if not isinstance(data, dict):
+            continue
+        node_name = _key if "error" in data else (data.get("self") or {}).get("node_name") or _key
+        if node_name and node_name not in seen:
+            node_order.append(node_name)
+            seen.add(node_name)
+        if "error" in data:
             continue
         self_info = data.get("self") or {}
-        node_name = self_info.get("node_name")
         pod_ip = self_info.get("pod_ip")
-        if node_name:
-            nodes_set.add(node_name)
-            if pod_ip:
-                ip_to_node[pod_ip] = node_name
-    return sorted(nodes_set), ip_to_node
+        if pod_ip and node_name:
+            ip_to_node[pod_ip] = node_name
+
+    return node_order, ip_to_node
+
+
+def _build_mgraph(node_order: list) -> dict:
+    """ingress-{i} matches NODE_STATUS_ENDPOINTS index; node_order[i] is the node for that index when aligned."""
+    ext = STATE["external_tests"]
+    n = len(NODE_STATUS_ENDPOINTS) if NODE_STATUS_ENDPOINTS else len(node_order)
+    ingress_nodeport = []
+    for i in range(n):
+        st = ext.get(f"ingress-{i} (HTTP)", {}).get("status", "unknown")
+        ingress_nodeport.append(st or "unknown")
+    return {"ingress_nodeport": ingress_nodeport}
+
 
 # ---------- Routes ----------
 async def handle_html(_): return web.Response(text=HTML_PAGE, content_type="text/html")
@@ -502,7 +735,14 @@ async def handle_html(_): return web.Response(text=HTML_PAGE, content_type="text
 async def handle_api(_):
     """Return STATE plus computed node_order and ip_to_node for dynamic dashboard."""
     node_order, ip_to_node = _build_node_order_and_ip_map()
-    payload = {**STATE, "node_order": node_order, "ip_to_node": ip_to_node}
+    payload = {
+        **STATE,
+        "history": _history_for_api(ip_to_node),
+        "node_order": node_order,
+        "ip_to_node": ip_to_node,
+        "mgraph": _build_mgraph(node_order),
+        "route_probe_url": ROUTE_PROBE_URL or None,
+    }
     return web.json_response(payload)
 
 async def handle_health(_): return web.Response(text="ok", content_type="text/plain")
@@ -526,6 +766,7 @@ async def handle_clear_history(_):
     # 1) set cutoff and clear local memory
     HISTORY_IGNORE_BEFORE = now_iso()
     STATE["history"].clear()
+    NODE_IP_HISTORY.clear()
     # 2) fan-out clear to peers (don't block response)
     asyncio.create_task(_fanout_clear_to_peers())
     return web.Response(text="history cleared", content_type="text/plain")
@@ -534,11 +775,9 @@ async def handle_clear_history(_):
 async def run_probes():
     tasks = []
     # Per-node status (primary): one poll task per NODE_STATUS_ENDPOINTS URL
-    for url in NODE_STATUS_ENDPOINTS:
+    for i, url in enumerate(NODE_STATUS_ENDPOINTS):
         tasks.append(asyncio.create_task(poll_node_status_task(url)))
-    # Optional: router test via ROUTE_STATUS_ENDPOINTS (one HTTP ping per node)
-    for i, url in enumerate(ROUTE_STATUS_ENDPOINTS):
-        tasks.append(asyncio.create_task(http_client_task(f"Router-{i}", url)))
+        tasks.append(asyncio.create_task(http_client_task(f"ingress-{i}", url, log_history=False)))
     # Legacy: ROUTE_PEERS (poll by name)
     for i, url in enumerate(ROUTE_PEERS, 1):
         rname = f"peer-{i}-route"
@@ -553,6 +792,8 @@ async def run_probes():
         tasks += [asyncio.create_task(ws_client_task(name, cfg["host"], cfg["ws_port"])),
                   asyncio.create_task(tcp_client_task(name, cfg["host"], cfg["tcp_port"])),
                   asyncio.create_task(http_client_task(name, f"http://{cfg['host']}:{cfg['http_port']}"))]
+    if ROUTE_PROBE_URL:
+        tasks.append(asyncio.create_task(http_client_task("route-probe", ROUTE_PROBE_URL)))
     await asyncio.gather(*tasks)
 
 # ---------- Main ----------

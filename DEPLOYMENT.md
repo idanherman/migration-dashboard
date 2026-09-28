@@ -76,7 +76,7 @@ podman tag your-registry.example.com:5000/applications/peer-app:v1.0.0 \
 
 ## Step 5: Deploy to Cluster (Script)
 
-The deploy script applies the DaemonSet, headless Service, NodePort Service exposing **8080 (WebSocket), 8081 (TCP), 8082 (HTTP)** (with image/namespace substitution), waits for pods, then runs **router sync**: labels pods with `node-name`, creates one Service and one Route per node, and prints **NODE_STATUS_ENDPOINTS**, **NODEPORT_PEERS** (for the external NodePort matrix), **ROUTE_STATUS_ENDPOINTS**, and optionally **METALLB_PEERS** when `APPLY_LOADBALANCER=yes` and LoadBalancers have external IPs.
+The deploy script applies the DaemonSet, headless Service, and NodePort Service exposing **8080 (WebSocket), 8081 (TCP), 8082 (HTTP)** (with image/namespace substitution), waits for pods, then prints **NODE_STATUS_ENDPOINTS** and **NODEPORT_PEERS** (one row per peer pod host IP, sorted by node name). With **`APPLY_ROUTE_PROBE=yes`** (default in `deploy.conf.example`), it also creates one shared **Route** to the NodePort service and prints **`ROUTE_PROBE_URL`** for the bastion router check. Optionally **METALLB_PEERS** when `APPLY_LOADBALANCER=yes`.
 
 ### Config file
 
@@ -94,14 +94,14 @@ oc create namespace migration-test-system   # if needed
 # Or override: ./scripts/deploy.sh -r local-registry.example.com:5000 -n migration-test-system
 ```
 
-Copy the printed NODE_STATUS_ENDPOINTS and ROUTE_STATUS_ENDPOINTS for bastion config.
+Copy the printed `NODE_STATUS_ENDPOINTS`, `NODEPORT_PEERS`, and `ROUTE_PROBE_URL` into `config.podman.env` (KEY=value, no `export` prefix).
 
 ### Verify
 
 ```bash
 oc get pods -n migration-test-system -l app=migration-peer
 oc get svc -n migration-test-system
-oc get routes -n migration-test-system
+oc get svc migration-peer-nodeport -n migration-test-system
 ```
 
 ## Step 6: Configure Bastion Client
@@ -110,7 +110,7 @@ oc get routes -n migration-test-system
 cp source/bastion-peer/config.example.env source/bastion-peer/config.env
 ```
 
-Set **NODE_STATUS_ENDPOINTS** (and optionally **ROUTE_STATUS_ENDPOINTS**) from the deploy script output. Optionally set METALLB_PEERS, NODEPORT_PEERS, ROUTE_PEERS for external tests.
+Set **NODE_STATUS_ENDPOINTS** and **NODEPORT_PEERS** from the deploy script output. Optionally set METALLB_PEERS or ROUTE_PEERS for legacy external tests.
 
 ## Step 7: Run Bastion Client
 
@@ -146,8 +146,6 @@ podman run -d \
 
 Alternatively, strip `export ` from a shell-style file before passing it to Podman:  
 `grep -v '^#' config.env | sed 's/^export //' > config.podman.env`
-
-`deploy.sh` prints **`ROUTE_STATUS_ENDPOINTS`** with **`http://`** by default (`ROUTE_STATUS_SCHEME` in `deploy.conf`), because many labs return **503 on :443** from the bastion while **:80** serves `/ping` fine. Use `ROUTE_STATUS_SCHEME=https` when TLS from the bastion works end-to-end.
 
 ### Option C: Run with Environment Variables
 
@@ -236,13 +234,13 @@ Open browser to: `http://localhost:9091`. The dashboard shows a **dynamic N×N**
 
 3. Check browser console for JavaScript errors
 
-4. Verify NODE_STATUS_ENDPOINTS and (if used) ROUTE_STATUS_ENDPOINTS are correct
+4. Verify NODE_STATUS_ENDPOINTS and NODEPORT_PEERS are correct
 
 ## Post-Deployment Verification
 
 1. **Pods Running**: DaemonSet pods (one per node) in Running state
-2. **Services**: Headless + NodePort + one Service per node (for Routes) created
-3. **Routes**: One Route per node if router sync was run
+2. **Services**: Headless + NodePort created
+3. **NodePort**: `migration-peer-nodeport` exposes 8080/8081/8082 on each node
 4. **Dashboard**: Loads at port 9091; dynamic N×N matrix and Mermaid connectivity graph show data
 5. **History**: Disconnection history tracked and clear fans out to all nodes
 
@@ -250,8 +248,8 @@ Open browser to: `http://localhost:9091`. The dashboard shows a **dynamic N×N**
 
 When cluster nodes are added or removed:
 
-1. Re-run the deploy script: `./scripts/deploy.sh -c deploy.conf` (or `--sync-routes` only to update Services/Routes).
-2. Update **NODE_STATUS_ENDPOINTS** and **ROUTE_STATUS_ENDPOINTS** in bastion config from the new script output.
+1. Re-run the deploy script: `./scripts/deploy.sh -c deploy.conf`
+2. Update **NODE_STATUS_ENDPOINTS** and **NODEPORT_PEERS** in bastion config from the new script output.
 3. Restart the bastion (or reload config if supported). The in-cluster TCP mesh self-heals via headless Service DNS.
 
 ## Maintenance

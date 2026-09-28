@@ -3,6 +3,8 @@ kind: Service
 metadata:
   name: migration-peer-nodeport
   namespace: migration-test-system  # Override via deploy script / NAMESPACE
+  labels:
+    app: migration-peer
 spec:
   type: NodePort
   externalTrafficPolicy: Local

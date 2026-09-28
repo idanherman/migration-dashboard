@@ -1,0 +1,55 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: poc-plugin
+  namespace: poc-console-plugin
+  labels:
+    app: poc-plugin
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: poc-plugin
+  template:
+    metadata:
+      labels:
+        app: poc-plugin
+    spec:
+      serviceAccountName: poc-plugin
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: poc-plugin
+          image: IMAGE_PLACEHOLDER
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 9443
+              protocol: TCP
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 10m
+              memory: 50Mi
+          volumeMounts:
+            - name: poc-plugin-cert
+              mountPath: /var/cert
+              readOnly: true
+            - name: nginx-conf
+              mountPath: /etc/nginx/nginx.conf
+              subPath: nginx.conf
+              readOnly: true
+      volumes:
+        - name: poc-plugin-cert
+          secret:
+            secretName: poc-plugin-cert
+            defaultMode: 420
+        - name: nginx-conf
+          configMap:
+            name: poc-plugin
+            defaultMode: 420

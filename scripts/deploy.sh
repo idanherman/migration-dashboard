@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
-# Deploy migration-test-system: DaemonSet + headless + NodePort, then sync Routes per node.
-# Uses config file (deploy.conf) and CLI overrides (-r REGISTRY, -n NAMESPACE).
-# Outputs NODE_STATUS_ENDPOINTS and ROUTE_STATUS_ENDPOINTS for bastion config.
+# Deploy migration-test-system: DaemonSet + headless + NodePort.
+# Outputs NODE_STATUS_ENDPOINTS and NODEPORT_PEERS for bastion config (per-node via NodePort + Local).
 
 set -e
 
@@ -15,14 +14,14 @@ NAMESPACE=""
 IMAGE_TAG="latest"
 PEER_APP_IMAGE="applications/peer-app"
 NODE_PORT_SVC_NAME="migration-peer-nodeport"
-SYNC_ROUTES_ONLY=""
+ROUTE_PROBE_NAME="migration-peer-route-probe"
+ROUTE_PROBE_SCHEME="${ROUTE_PROBE_SCHEME:-http}"
 
 usage() {
   echo "Usage: $0 [OPTIONS]"
   echo "  -c, --config FILE   Config file (key=value per line)"
   echo "  -r, --registry URL  Image registry (overrides config)"
   echo "  -n, --namespace NS Namespace (overrides config)"
-  echo "  --sync-routes       Only run router sync (label pods, create Service+Route per node)"
   echo "  -h, --help          This help"
 }
 
@@ -31,13 +30,11 @@ while [[ $# -gt 0 ]]; do
     -c|--config) CONFIG_FILE="$2"; shift 2 ;;
     -r|--registry) REGISTRY="$2"; shift 2 ;;
     -n|--namespace) NAMESPACE="$2"; shift 2 ;;
-    --sync-routes) SYNC_ROUTES_ONLY=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown option: $1"; usage; exit 1 ;;
   esac
 done
 
-# Load config file
 if [[ -n "$CONFIG_FILE" ]]; then
   if [[ ! -f "$CONFIG_FILE" ]]; then
     echo "Config file not found: $CONFIG_FILE"
@@ -54,14 +51,13 @@ elif [[ -f "$REPO_ROOT/deploy.conf" ]]; then
   set +a
 fi
 
-# CLI overrides
 [[ -n "$REGISTRY" ]] && export REGISTRY
 [[ -n "$NAMESPACE" ]] && export NAMESPACE
 IMAGE_TAG="${IMAGE_TAG:-latest}"
 PEER_APP_IMAGE="${PEER_APP_IMAGE:-applications/peer-app}"
 NODE_PORT_SVC_NAME="${NODE_PORT_SVC_NAME:-migration-peer-nodeport}"
-# Bastion HTTP probes to OpenShift routes: http = :80 (avoids TLS verify and many edge 503 on :443 from lab networks)
-ROUTE_STATUS_SCHEME="${ROUTE_STATUS_SCHEME:-http}"
+ROUTE_PROBE_NAME="${ROUTE_PROBE_NAME:-migration-peer-route-probe}"
+ROUTE_PROBE_SCHEME="${ROUTE_PROBE_SCHEME:-http}"
 
 if [[ -z "$NAMESPACE" ]]; then
   echo "NAMESPACE is required (set in config or -n)"
@@ -108,148 +104,86 @@ _delete_stale_per_node_lb_svcs() {
   done < <(oc get svc -n "$ns" -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null | grep '^migration-peer-lb-' || true)
 }
 
-if [[ -n "$SYNC_ROUTES_ONLY" ]]; then
-  echo "=== Sync routes only (label pods, Service+Route per node) ==="
-  # List DaemonSet pods and their node names
-  PODS_JSON=$(oc get pods -n "$NAMESPACE" -l app=migration-peer -o json 2>/dev/null || true)
-  if [[ -z "$PODS_JSON" ]] || [[ "$PODS_JSON" == *"items":[]* ]]; then
-    echo "No migration-peer pods found in namespace $NAMESPACE"
+echo "=== Deploying manifests (namespace=$NAMESPACE, image=$FULL_IMAGE) ==="
+for f in daemonset-migration-peer.yaml service-migration-peer-headless.yaml service-migration-peer-nodeport.yaml servicemonitor-migration-peer.yaml; do
+  path="$MANIFESTS_DIR/$f"
+  if [[ ! -f "$path" ]]; then
+    echo "Manifest not found: $path"
     exit 1
   fi
+  sed -e "s|namespace:.*# Override.*|namespace: $NAMESPACE|" \
+      -e "s|registry.example.com/applications/peer-app:latest|$FULL_IMAGE|g" \
+      -e "s|migration-test-system|$NAMESPACE|g" \
+      "$path" | oc apply -f -
+done
 
-  # Label each pod with node-name
+echo "Waiting for DaemonSet migration-peer..."
+oc rollout status daemonset/migration-peer -n "$NAMESPACE" --timeout=300s 2>/dev/null || true
+
+# Optional MetalLB (requires node-name label on pods; only if APPLY_LOADBALANCER=yes)
+PODS_JSON=$(oc get pods -n "$NAMESPACE" -l app=migration-peer -o json 2>/dev/null || true)
+if [[ -n "$PODS_JSON" ]] && [[ "$PODS_JSON" != *'"items":[]'* ]]; then
+  NODES=()
+  while read -r n; do [[ -n "$n" ]] && NODES+=("$n"); done < <(echo "$PODS_JSON" | jq -r '.items[].spec.nodeName' | sort -u)
+  if [[ "${APPLY_LOADBALANCER:-}" == "yes" || "${APPLY_LOADBALANCER:-}" == "1" ]]; then
   while read -r pod_name node_name; do
     [[ -z "$pod_name" ]] && continue
     oc label pod -n "$NAMESPACE" "$pod_name" node-name="$node_name" --overwrite 2>/dev/null || true
   done < <(echo "$PODS_JSON" | jq -r '.items[] | "\(.metadata.name) \(.spec.nodeName)"')
-
-  # Get unique node names that have a pod
-  NODES=()
-  while read -r n; do [[ -n "$n" ]] && NODES+=("$n"); done < <(echo "$PODS_JSON" | jq -r '.items[].spec.nodeName' | sort -u)
-
-  # Create Service + Route per node
-  for node in "${NODES[@]}"; do
-    node_safe=$(echo "$node" | tr '.' '-' | tr '[:upper:]' '[:lower:]' | sed 's/^[-]*//')
-    svc_name="migration-peer-${node_safe}"
-    oc get svc -n "$NAMESPACE" "$svc_name" &>/dev/null || oc create service clusterip "$svc_name" -n "$NAMESPACE" --tcp=8082 2>/dev/null || true
-    oc patch svc -n "$NAMESPACE" "$svc_name" -p "{\"spec\":{\"selector\":{\"app\":\"migration-peer\",\"node-name\":\"$node\"}}}" --type=merge 2>/dev/null || true
-    oc get route -n "$NAMESPACE" "$svc_name" &>/dev/null || oc expose svc -n "$NAMESPACE" "$svc_name" --name="$svc_name" 2>/dev/null || true
-  done
-
-  _sync_per_node_lb_svcs "$NAMESPACE" "${NODES[@]}"
-
-  # Delete Services/Routes for nodes that no longer have a pod
-  current_safes=()
-  for node in "${NODES[@]}"; do
-    current_safes+=("$(echo "$node" | tr '.' '-' | tr '[:upper:]' '[:lower:]' | sed 's/^[-]*//')")
-  done
-  for rname in $(oc get routes -n "$NAMESPACE" -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null); do
-    [[ "$rname" != migration-peer-* ]] && continue
-    node_safe="${rname#migration-peer-}"
-    if [[ ! " ${current_safes[*]} " =~ " ${node_safe} " ]]; then
-      oc delete route -n "$NAMESPACE" "$rname" --ignore-not-found 2>/dev/null || true
-      oc delete svc -n "$NAMESPACE" "$rname" --ignore-not-found 2>/dev/null || true
-    fi
-  done
-  _delete_stale_per_node_lb_svcs "$NAMESPACE" "${current_safes[@]}"
-
-  echo "Router sync done."
+    _sync_per_node_lb_svcs "$NAMESPACE" "${NODES[@]}"
+    _delete_stale_per_node_lb_svcs "$NAMESPACE" "${NODES[@]}"
+  fi
 fi
 
-if [[ -z "$SYNC_ROUTES_ONLY" ]]; then
-  echo "=== Deploying manifests (namespace=$NAMESPACE, image=$FULL_IMAGE) ==="
-  for f in daemonset-migration-peer.yaml service-migration-peer-headless.yaml service-migration-peer-nodeport.yaml; do
-    path="$MANIFESTS_DIR/$f"
-    if [[ ! -f "$path" ]]; then
-      echo "Manifest not found: $path"
-      exit 1
-    fi
-    sed -e "s|namespace:.*# Override.*|namespace: $NAMESPACE|" \
-        -e "s|registry.example.com/applications/peer-app:latest|$FULL_IMAGE|g" \
-        -e "s|migration-test-system|$NAMESPACE|g" \
-        "$path" | oc apply -f -
-  done
-
-  echo "Waiting for DaemonSet migration-peer..."
-  oc rollout status daemonset/migration-peer -n "$NAMESPACE" --timeout=120s 2>/dev/null || true
-
-  echo "=== Syncing routes (label pods, Service+Route per node) ==="
-  PODS_JSON=$(oc get pods -n "$NAMESPACE" -l app=migration-peer -o json 2>/dev/null || true)
-  if [[ -n "$PODS_JSON" ]] && [[ "$PODS_JSON" != *'"items":[]'* ]]; then
-    while read -r pod_name node_name; do
-      [[ -z "$pod_name" ]] && continue
-      oc label pod -n "$NAMESPACE" "$pod_name" node-name="$node_name" --overwrite 2>/dev/null || true
-    done < <(echo "$PODS_JSON" | jq -r '.items[] | "\(.metadata.name) \(.spec.nodeName)"')
-    NODES=()
-    while read -r n; do [[ -n "$n" ]] && NODES+=("$n"); done < <(echo "$PODS_JSON" | jq -r '.items[].spec.nodeName' | sort -u)
-    for node in "${NODES[@]}"; do
-      node_safe=$(echo "$node" | tr '.' '-' | tr '[:upper:]' '[:lower:]' | sed 's/^[-]*//')
-      svc_name="migration-peer-${node_safe}"
-      oc get svc -n "$NAMESPACE" "$svc_name" &>/dev/null || oc create service clusterip "$svc_name" -n "$NAMESPACE" --tcp=8082 2>/dev/null || true
-      oc patch svc -n "$NAMESPACE" "$svc_name" -p "{\"spec\":{\"selector\":{\"app\":\"migration-peer\",\"node-name\":\"$node\"}}}" --type=merge 2>/dev/null || true
-      oc get route -n "$NAMESPACE" "$svc_name" &>/dev/null || oc expose svc -n "$NAMESPACE" "$svc_name" --name="$svc_name" 2>/dev/null || true
-    done
-    _sync_per_node_lb_svcs "$NAMESPACE" "${NODES[@]}"
-    current_safes=()
-    for node in "${NODES[@]}"; do current_safes+=("$(echo "$node" | tr '.' '-' | tr '[:upper:]' '[:lower:]' | sed 's/^[-]*//')"); done
-    for rname in $(oc get routes -n "$NAMESPACE" -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null); do
-      [[ "$rname" != migration-peer-* ]] && continue
-      node_safe="${rname#migration-peer-}"
-      if [[ ! " ${current_safes[*]} " =~ " ${node_safe} " ]]; then
-        oc delete route -n "$NAMESPACE" "$rname" --ignore-not-found 2>/dev/null || true
-        oc delete svc -n "$NAMESPACE" "$rname" --ignore-not-found 2>/dev/null || true
-      fi
-    done
-    _delete_stale_per_node_lb_svcs "$NAMESPACE" "${current_safes[@]}"
+if [[ "${APPLY_ROUTE_PROBE:-}" == "yes" || "${APPLY_ROUTE_PROBE:-}" == "1" ]]; then
+  echo "=== Shared OpenShift Route (router probe) ==="
+  if ! oc get route -n "$NAMESPACE" "$ROUTE_PROBE_NAME" &>/dev/null; then
+    oc expose svc -n "$NAMESPACE" "$NODE_PORT_SVC_NAME" --name="$ROUTE_PROBE_NAME" --port=8082
   fi
 fi
 
 echo ""
-echo "=== Bastion config (paste into config.env or set env) ==="
+echo "=== Bastion config (paste into config.podman.env) ==="
 NODEPORT=$(oc get svc -n "$NAMESPACE" "$NODE_PORT_SVC_NAME" -o jsonpath='{.spec.ports[?(@.port==8082)].nodePort}' 2>/dev/null || true)
 if [[ -z "$NODEPORT" ]]; then
   echo "Could not get NodePort for $NODE_PORT_SVC_NAME"
 else
-  NODE_IPS=()
-  while read -r ip; do [[ -n "$ip" ]] && NODE_IPS+=("$ip"); done < <(oc get nodes -o jsonpath='{range .items[*]}{.status.addresses[?(@.type=="InternalIP")].address}{"\n"}{end}' 2>/dev/null)
   NODE_URLS=()
-  for ip in "${NODE_IPS[@]}"; do
-    NODE_URLS+=("http://${ip}:${NODEPORT}")
-  done
-  NODE_STATUS_ENDPOINTS=$(IFS=,; echo "${NODE_URLS[*]}")
-  echo "export NODE_STATUS_ENDPOINTS=\"$NODE_STATUS_ENDPOINTS\""
-fi
+  while read -r ip _node; do
+    [[ -n "$ip" ]] && NODE_URLS+=("http://${ip}:${NODEPORT}")
+  done < <(oc get pods -n "$NAMESPACE" -l app=migration-peer -o json \
+    | jq -r '.items | sort_by(.spec.nodeName)[] | "\(.status.hostIP) \(.spec.nodeName)"')
+  if [[ ${#NODE_URLS[@]} -eq 0 ]]; then
+    echo "# No migration-peer pods found; check DaemonSet"
+  else
+    NODE_STATUS_ENDPOINTS=$(IFS=,; echo "${NODE_URLS[*]}")
+    echo "NODE_STATUS_ENDPOINTS=$NODE_STATUS_ENDPOINTS"
+  fi
 
-ROUTE_URLS=()
-while read -r name host; do
-  [[ "$name" == migration-peer-* ]] && [[ -n "$host" ]] && ROUTE_URLS+=("${ROUTE_STATUS_SCHEME}://${host}")
-done < <(oc get routes -n "$NAMESPACE" -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.host}{"\n"}{end}' 2>/dev/null)
-if [[ ${#ROUTE_URLS[@]} -gt 0 ]]; then
-  ROUTE_STATUS_ENDPOINTS=$(IFS=,; echo "${ROUTE_URLS[*]}")
-  echo "export ROUTE_STATUS_ENDPOINTS=\"$ROUTE_STATUS_ENDPOINTS\""
-fi
-
-NP_WS=$(oc get svc -n "$NAMESPACE" "$NODE_PORT_SVC_NAME" -o jsonpath='{.spec.ports[?(@.name=="ws")].nodePort}' 2>/dev/null || true)
-NP_TCP=$(oc get svc -n "$NAMESPACE" "$NODE_PORT_SVC_NAME" -o jsonpath='{.spec.ports[?(@.name=="tcp")].nodePort}' 2>/dev/null || true)
-NP_HTTP=$(oc get svc -n "$NAMESPACE" "$NODE_PORT_SVC_NAME" -o jsonpath='{.spec.ports[?(@.name=="http")].nodePort}' 2>/dev/null || true)
-if [[ -n "$NP_WS" && -n "$NP_TCP" && -n "$NP_HTTP" ]]; then
-  IPS_LINE=$(oc get nodes -o jsonpath='{range .items[*]}{.status.addresses[?(@.type=="InternalIP")].address}{" "}{end}' 2>/dev/null | sed 's/[[:space:]]*$//')
-  NODEPORT_PEERS_JSON=$(
-    IPS_LINE="$IPS_LINE" NP_WS="$NP_WS" NP_TCP="$NP_TCP" NP_HTTP="$NP_HTTP" python3 - <<'PY'
-import json, os
-ips = [x for x in os.environ.get("IPS_LINE", "").split() if x]
-try:
-    ws, tcp, http = int(os.environ["NP_WS"]), int(os.environ["NP_TCP"]), int(os.environ["NP_HTTP"])
-except (KeyError, ValueError):
-    print("{}")
-else:
-    out = {}
-    for i, ip in enumerate(ips, 1):
-        out[f"peer-{i}-np"] = {"host": ip, "ws_port": ws, "tcp_port": tcp, "http_port": http}
-    print(json.dumps(out))
-PY
-  )
-  echo "export NODEPORT_PEERS='$NODEPORT_PEERS_JSON'"
+  NP_WS=$(oc get svc -n "$NAMESPACE" "$NODE_PORT_SVC_NAME" -o jsonpath='{.spec.ports[?(@.name=="ws")].nodePort}' 2>/dev/null || true)
+  NP_TCP=$(oc get svc -n "$NAMESPACE" "$NODE_PORT_SVC_NAME" -o jsonpath='{.spec.ports[?(@.name=="tcp")].nodePort}' 2>/dev/null || true)
+  NP_HTTP=$(oc get svc -n "$NAMESPACE" "$NODE_PORT_SVC_NAME" -o jsonpath='{.spec.ports[?(@.name=="http")].nodePort}' 2>/dev/null || true)
+  if [[ -n "$NP_WS" && -n "$NP_TCP" && -n "$NP_HTTP" ]]; then
+    NODEPORT_PEERS_JSON=$(oc get pods -n "$NAMESPACE" -l app=migration-peer -o json | \
+      NP_WS="$NP_WS" NP_TCP="$NP_TCP" NP_HTTP="$NP_HTTP" python3 -c '
+import json, os, sys
+pods = json.load(sys.stdin).get("items", [])
+pods.sort(key=lambda p: p["spec"]["nodeName"])
+out = {}
+for i, p in enumerate(pods, 1):
+    ip = (p.get("status") or {}).get("hostIP")
+    if not ip:
+        continue
+    out[f"peer-{i}-np"] = {
+        "host": ip,
+        "ws_port": int(os.environ["NP_WS"]),
+        "tcp_port": int(os.environ["NP_TCP"]),
+        "http_port": int(os.environ["NP_HTTP"]),
+    }
+print(json.dumps(out))
+')
+    [[ -n "$NODEPORT_PEERS_JSON" && "$NODEPORT_PEERS_JSON" != "{}" ]] && echo "NODEPORT_PEERS=$NODEPORT_PEERS_JSON"
+  fi
 fi
 
 if [[ "${APPLY_LOADBALANCER:-}" == "yes" || "${APPLY_LOADBALANCER:-}" == "1" ]]; then
@@ -274,9 +208,16 @@ for item in sorted(data.get('items', []), key=lambda x: x['metadata']['name']):
 print(json.dumps(out))
 ")
   if [[ -n "$METALLB_JSON" && "$METALLB_JSON" != "{}" ]]; then
-    echo "export METALLB_PEERS='$METALLB_JSON'"
+    echo "METALLB_PEERS=$METALLB_JSON"
+  fi
+fi
+
+if [[ "${APPLY_ROUTE_PROBE:-}" == "yes" || "${APPLY_ROUTE_PROBE:-}" == "1" ]]; then
+  ROUTE_HOST=$(oc get route -n "$NAMESPACE" "$ROUTE_PROBE_NAME" -o jsonpath='{.spec.host}' 2>/dev/null || true)
+  if [[ -n "$ROUTE_HOST" ]]; then
+    echo "ROUTE_PROBE_URL=${ROUTE_PROBE_SCHEME}://${ROUTE_HOST}"
   else
-    echo "# METALLB_PEERS: no external IPs yet on migration-peer-lb-* (oc get svc -n $NAMESPACE; wait for LoadBalancer)"
+    echo "# ROUTE_PROBE_URL: route $ROUTE_PROBE_NAME not found in $NAMESPACE"
   fi
 fi
 

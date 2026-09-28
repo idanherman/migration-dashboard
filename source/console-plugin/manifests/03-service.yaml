@@ -1,0 +1,18 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: poc-plugin
+  namespace: poc-console-plugin
+  labels:
+    app: poc-plugin
+  annotations:
+    service.beta.openshift.io/serving-cert-secret-name: poc-plugin-cert
+spec:
+  type: ClusterIP
+  selector:
+    app: poc-plugin
+  ports:
+    - name: 9443-tcp
+      protocol: TCP
+      port: 9443
+      targetPort: 9443

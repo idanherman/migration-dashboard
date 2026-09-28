@@ -1,0 +1,11 @@
+# Enable OpenShift User Workload Monitoring so ServiceMonitors in app
+# namespaces (e.g. migration-test-system) are scraped.
+# Apply: oc apply -f enable-user-workload-monitoring.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cluster-monitoring-config
+  namespace: openshift-monitoring
+data:
+  config.yaml: |
+    enableUserWorkload: true

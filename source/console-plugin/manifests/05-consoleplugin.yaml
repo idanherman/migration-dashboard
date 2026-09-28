@@ -1,0 +1,17 @@
+apiVersion: console.openshift.io/v1
+kind: ConsolePlugin
+metadata:
+  name: poc-plugin
+  labels:
+    app: poc-plugin
+spec:
+  displayName: POC Console Plugin
+  i18n:
+    loadType: Preload
+  backend:
+    type: Service
+    service:
+      name: poc-plugin
+      namespace: poc-console-plugin
+      port: 9443
+      basePath: /

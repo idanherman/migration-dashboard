@@ -14,8 +14,8 @@ The system consists of three main components:
 
 ### Bastion Client
 - **Primary**: Polls **NODE_STATUS_ENDPOINTS** (one URL per node via NodePort with `externalTrafficPolicy: Local`) for `/status` and `/history`; builds a dynamic NÃ—N connectivity matrix and optional **Mermaid connectivity graph**
-- **Optional**: **ROUTE_STATUS_ENDPOINTS** to test OpenShift router per node
-- **Optional**: MetalLB / NodePort / Route external tests (legacy)
+- **External**: NodePort matrix (HTTP/WS/TCP per node) via **NODEPORT_PEERS**; **ROUTE_PROBE_URL** tests one shared OpenShift Route (router path); ingress graph uses per-node NodePort `/ping`
+- **Optional**: MetalLB / ROUTE_PEERS (legacy)
 - Clear history fans out to all NODE_STATUS_ENDPOINTS
 - Dashboard on port 9091
 
@@ -92,13 +92,13 @@ podman load -i migration-dashboard-images.tar
    # Set REGISTRY= (e.g. local registry for airgap), NAMESPACE=migration-test-system
    ```
 
-2. Deploy (substitutes REGISTRY/NAMESPACE in manifests, applies DaemonSet + headless + NodePort, syncs Routes per node):
+2. Deploy (substitutes REGISTRY/NAMESPACE in manifests, applies DaemonSet + headless + NodePort):
    ```bash
    ./scripts/deploy.sh -c deploy.conf
    # Or override: ./scripts/deploy.sh -r my-registry:5000 -n migration-test-system
    ```
 
-3. Paste the script output (`NODE_STATUS_ENDPOINTS` and optionally `ROUTE_STATUS_ENDPOINTS`) into bastion `config.env`.
+3. Paste the script output (`NODE_STATUS_ENDPOINTS`, `NODEPORT_PEERS`) into bastion `config.podman.env`.
 
 #### Configure Bastion Client
 
@@ -107,7 +107,7 @@ podman load -i migration-dashboard-images.tar
    cp source/bastion-peer/config.example.env source/bastion-peer/config.env
    ```
 
-2. Set **NODE_STATUS_ENDPOINTS** (and optionally **ROUTE_STATUS_ENDPOINTS**) from the deploy script output. Optionally set MetalLB/NodePort/Route for external tests.
+2. Set **NODE_STATUS_ENDPOINTS** and **NODEPORT_PEERS** from the deploy script output. Optionally set METALLB_PEERS.
    - Test intervals
 
 3. Use configuration:
@@ -136,9 +136,9 @@ cp scripts/deploy.conf.example deploy.conf
 # Or: ./scripts/deploy.sh -r my-registry:5000 -n migration-test-system
 ```
 
-The script applies the DaemonSet, headless Service, NodePort Service, waits for pods, labels pods with `node-name`, creates one Service and one Route per node (for router test), then prints **NODE_STATUS_ENDPOINTS** and **ROUTE_STATUS_ENDPOINTS**. Paste those into bastion `config.env`.
+The script applies the DaemonSet, headless Service, and NodePort Service, waits for pods, then prints **NODE_STATUS_ENDPOINTS** and **NODEPORT_PEERS** (per peer pod, sorted by node name). Paste those into bastion `config.podman.env`.
 
-**When nodes are added or removed:** Re-run `./scripts/deploy.sh -c deploy.conf` (or `--sync-routes` only to update Routes), then update NODE_STATUS_ENDPOINTS and ROUTE_STATUS_ENDPOINTS in bastion config and restart the bastion. The in-cluster mesh self-heals via DNS.
+**When nodes are added or removed:** Re-run `./scripts/deploy.sh -c deploy.conf`, update bastion config from the new output, and restart the dashboard container. The in-cluster mesh self-heals via DNS.
 
 ### 5. Run Bastion Client
 
@@ -166,9 +166,9 @@ Access dashboard at: `http://localhost:9091`. The dashboard shows a **dynamic NÃ
 | Variable | Description | Format |
 |----------|-------------|--------|
 | `NODE_STATUS_ENDPOINTS` | Per-node URLs (NodePort Local); required for internal status | Comma-separated |
-| `ROUTE_STATUS_ENDPOINTS` | Per-node URLs via Route (router test); optional | Comma-separated |
 | `METALLB_PEERS` | MetalLB IPs (optional external test) | JSON object |
-| `NODEPORT_PEERS` | NodePort config (optional) | JSON object |
+| `NODEPORT_PEERS` | NodePort matrix (HTTP/WS/TCP per node) | JSON object |
+| `ROUTE_PROBE_URL` | Shared OpenShift Route base URL (`/ping`); optional | URL |
 | `ROUTE_PEERS` | Legacy route URLs (optional) | Comma-separated |
 | `POLL_INTERVAL` | Status poll interval (seconds) | Float |
 | `DASHBOARD_PORT` | Dashboard web port | Integer |
@@ -182,7 +182,7 @@ Access dashboard at: `http://localhost:9091`. The dashboard shows a **dynamic NÃ
 | `NAMESPACE` | Namespace (downward API) | - |
 | `POD_IP`, `NODE_NAME`, `HOSTNAME` | Set from downward API | - |
 | `CHECK_INTERVAL` | TCP check interval (seconds) | 10.0 |
-| `PEER_RESOLVE_INTERVAL` | DNS re-resolve interval (seconds) | 60.0 |
+| `PEER_RESOLVE_INTERVAL` | DNS re-resolve interval (seconds); also nudged on TCP disconnect | 10.0 |
 
 ## Building Images with Offline Dependencies
 

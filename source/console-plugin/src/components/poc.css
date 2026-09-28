@@ -1,0 +1,21 @@
+/* Prefix classes with the plugin name so they cannot override console styles. */
+.poc-plugin__page {
+  padding: 2rem;
+  max-width: 48rem;
+}
+
+.poc-plugin__title {
+  font-size: 1.75rem;
+  font-weight: 600;
+  margin: 0 0 1rem;
+}
+
+.poc-plugin__body {
+  margin: 0 0 0.75rem;
+  line-height: 1.5;
+}
+
+.poc-plugin__button {
+  margin-top: 0.5rem;
+  padding: 0.5rem 1rem;
+}

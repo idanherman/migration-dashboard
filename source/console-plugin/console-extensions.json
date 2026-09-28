@@ -1,0 +1,20 @@
+[
+  {
+    "type": "console.page/route",
+    "properties": {
+      "exact": true,
+      "path": "/poc-plugin",
+      "component": { "$codeRef": "PocPage" }
+    }
+  },
+  {
+    "type": "console.navigation/href",
+    "properties": {
+      "id": "poc-plugin",
+      "name": "POC Plugin",
+      "href": "/poc-plugin",
+      "perspective": "admin",
+      "section": "home"
+    }
+  }
+]

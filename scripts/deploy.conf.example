@@ -8,14 +8,16 @@ REGISTRY=registry.example.com:5000
 NAMESPACE=migration-test-system
 
 # Optional: image tag and name
-IMAGE_TAG=v1.0.1
+IMAGE_TAG=v1.0.3
 PEER_APP_IMAGE=applications/peer-app
 
 # Optional: NodePort service name (used to read port)
 NODE_PORT_SVC_NAME=migration-peer-nodeport
 
-# Optional: scheme for ROUTE_STATUS_ENDPOINTS printed at end (http|https). Default http for bastion /ping probes.
-# ROUTE_STATUS_SCHEME=https
+# Optional: expose NodePort svc via one shared Route; prints ROUTE_PROBE_URL for bastion (router health).
+APPLY_ROUTE_PROBE=yes
+# ROUTE_PROBE_SCHEME=https
+# ROUTE_PROBE_NAME=migration-peer-route-probe
 
 # Optional: create one LoadBalancer Service per node (migration-peer-lb-<node>) for bastion METALLB_PEERS matrix.
 # Requires MetalLB (or cloud LB). Default no.

@@ -1,0 +1,21 @@
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: migration-peer
+  namespace: migration-test-system  # Override via deploy script / NAMESPACE
+  labels:
+    app: migration-peer
+spec:
+  selector:
+    matchLabels:
+      app: migration-peer
+      monitoring: scrape
+  namespaceSelector:
+    matchNames:
+      - migration-test-system
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 15s
+      scrapeTimeout: 10s
+  # Prefer headless service only (avoid double scrape via NodePort svc).

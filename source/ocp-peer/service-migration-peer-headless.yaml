@@ -3,6 +3,9 @@ kind: Service
 metadata:
   name: migration-peer-svc
   namespace: migration-test-system  # Override via deploy script / NAMESPACE
+  labels:
+    app: migration-peer
+    monitoring: scrape
 spec:
   clusterIP: None
   selector:

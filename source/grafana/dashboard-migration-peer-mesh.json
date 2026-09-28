@@ -1,0 +1,345 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "type": "jdbranham-diagram-panel",
+      "title": "TCP mesh topology",
+      "description": "Mermaid diagram. Edges colored by tcp_up metric: green = UP, red = DOWN. Value on each link = metric value.",
+      "id": 1,
+      "gridPos": { "h": 14, "w": 14, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "thanos" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "thanos" },
+          "expr": "max by (src_node, dst_node) (migration_peer_tcp_up)",
+          "legendFormat": "{{src_node}}_to_{{dst_node}}",
+          "instant": true
+        }
+      ],
+      "options": {
+        "mode": "content",
+        "content": "graph LR\n  w0[\"iherman-worker0\"] -->|\"iherman-worker0_to_iherman-worker1\"| w1[\"iherman-worker1\"]\n  w1 -->|\"iherman-worker1_to_iherman-worker0\"| w0\n  w0 -->|\"iherman-worker0_to_iherman-worker2\"| w2[\"iherman-worker2\"]\n  w2 -->|\"iherman-worker2_to_iherman-worker0\"| w0\n  w1 -->|\"iherman-worker1_to_iherman-worker2\"| w2\n  w2 -->|\"iherman-worker2_to_iherman-worker1\"| w1",
+        "valueName": "last",
+        "styleValues": {
+          "fontColor": "#ffffff"
+        },
+        "moddedSeriesVal": 0,
+        "maxWidth": false,
+        "legend": { "show": true, "gradient": { "enabled": true } },
+        "composites": []
+      },
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "green", "value": 1 }
+            ]
+          },
+          "mappings": [
+            { "type": "value", "options": { "0": { "text": "DOWN", "color": "red", "index": 0 }, "1": { "text": "UP", "color": "green", "index": 1 } } }
+          ]
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Peers",
+      "id": 4,
+      "gridPos": { "h": 4, "w": 5, "x": 14, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "thanos" },
+      "targets": [
+        { "refId": "A", "expr": "count(migration_peer_info)", "instant": true }
+      ],
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value_and_name"
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Edges UP",
+      "id": 5,
+      "gridPos": { "h": 4, "w": 5, "x": 19, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "thanos" },
+      "targets": [
+        { "refId": "A", "expr": "count(max by (src_node, dst_node) (migration_peer_tcp_up) == 1)", "instant": true }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "green", "value": 1 }
+            ]
+          }
+        }
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "colorMode": "background",
+        "graphMode": "none"
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Edges DOWN",
+      "id": 6,
+      "gridPos": { "h": 4, "w": 5, "x": 14, "y": 4 },
+      "datasource": { "type": "prometheus", "uid": "thanos" },
+      "targets": [
+        { "refId": "A", "expr": "count(max by (src_node, dst_node) (migration_peer_tcp_up) == 0) OR on() vector(0)", "instant": true }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 1 }
+            ]
+          }
+        }
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "colorMode": "background",
+        "graphMode": "none"
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Total disconnects",
+      "id": 7,
+      "gridPos": { "h": 4, "w": 5, "x": 19, "y": 4 },
+      "datasource": { "type": "prometheus", "uid": "thanos" },
+      "targets": [
+        { "refId": "A", "expr": "sum(max by (src_node, dst_node) (migration_peer_tcp_disconnects_total))", "instant": true }
+      ],
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "colorMode": "value",
+        "graphMode": "area"
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Mesh health",
+      "id": 9,
+      "gridPos": { "h": 6, "w": 10, "x": 14, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "thanos" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "count(max by (src_node, dst_node) (migration_peer_tcp_up) == 1) / count(max by (src_node, dst_node) (migration_peer_tcp_up))",
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "orange", "value": 0.8 },
+              { "color": "green", "value": 1 }
+            ]
+          }
+        }
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "colorMode": "background",
+        "graphMode": "none"
+      }
+    },
+    {
+      "type": "table",
+      "title": "Edge status",
+      "id": 2,
+      "gridPos": { "h": 10, "w": 12, "x": 0, "y": 14 },
+      "datasource": { "type": "prometheus", "uid": "thanos" },
+      "targets": [
+        {
+          "refId": "up",
+          "expr": "max by (src_node, dst_node) (migration_peer_tcp_up)",
+          "format": "table",
+          "instant": true
+        }
+      ],
+      "transformations": [
+        { "id": "labelsToFields", "options": { "mode": "columns" } },
+        { "id": "merge", "options": {} },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true
+            },
+            "renameByName": {
+              "src_node": "From",
+              "dst_node": "To",
+              "Value": "Up"
+            },
+            "indexByName": { "From": 0, "To": 1, "Up": 2 }
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 0,
+          "custom": { "align": "center", "filterable": true }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "Up" },
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  { "type": "value", "options": { "0": { "text": "DOWN", "color": "red", "index": 0 }, "1": { "text": "UP", "color": "green", "index": 1 } } }
+                ]
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    { "color": "red", "value": null },
+                    { "color": "green", "value": 1 }
+                  ]
+                }
+              },
+              { "id": "color", "value": { "mode": "thresholds" } },
+              { "id": "custom.cellOptions", "value": { "type": "color-background" } }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "sortBy": [{ "displayName": "From", "desc": false }]
+      }
+    },
+    {
+      "type": "table",
+      "title": "Disconnect counters (since peer pod start)",
+      "id": 8,
+      "gridPos": { "h": 10, "w": 12, "x": 12, "y": 14 },
+      "datasource": { "type": "prometheus", "uid": "thanos" },
+      "targets": [
+        {
+          "refId": "disc",
+          "expr": "max by (src_node, dst_node) (migration_peer_tcp_disconnects_total)",
+          "format": "table",
+          "instant": true
+        }
+      ],
+      "transformations": [
+        { "id": "labelsToFields", "options": { "mode": "columns" } },
+        { "id": "merge", "options": {} },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true
+            },
+            "renameByName": {
+              "src_node": "From",
+              "dst_node": "To",
+              "Value": "Disconnects"
+            },
+            "indexByName": { "From": 0, "To": 1, "Disconnects": 2 }
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 0,
+          "custom": { "align": "center", "filterable": true }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "Disconnects" },
+            "properties": [
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    { "color": "green", "value": null },
+                    { "color": "orange", "value": 1 },
+                    { "color": "red", "value": 5 }
+                  ]
+                }
+              },
+              { "id": "color", "value": { "mode": "thresholds" } },
+              { "id": "custom.cellOptions", "value": { "type": "color-background" } }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "sortBy": [{ "displayName": "Disconnects", "desc": true }]
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Disconnect rate (flaps / min)",
+      "id": 3,
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 24 },
+      "datasource": { "type": "prometheus", "uid": "thanos" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (src_node, dst_node) (rate(migration_peer_tcp_disconnects_total[5m])) * 60",
+          "legendFormat": "{{src_node}} → {{dst_node}}",
+          "range": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "cpm",
+          "decimals": 2,
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "fillOpacity": 15,
+            "showPoints": "auto",
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "right", "calcs": ["sum", "max"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      }
+    }
+  ],
+  "refresh": "10s",
+  "schemaVersion": 39,
+  "tags": ["migration", "ovn", "mesh"],
+  "templating": { "list": [] },
+  "time": { "from": "now-1h", "to": "now" },
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "Migration peer TCP mesh",
+  "uid": "migration-peer-mesh",
+  "version": 4
+}
